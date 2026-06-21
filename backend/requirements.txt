@@ -6,4 +6,5 @@ pydantic
 langgraph
 langchain-openai
 langchain-core
+langchain-mistralai
 httpx

@@ -80,7 +80,13 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
         # --- Guard: Check if this is a status update, not a user message ---
         if "messages" not in value:
             # This is a status update (sent/delivered/read notification).
-            # Log it and return immediately — do NOT crash.
+            # If it's a failed status, let's log the error.
+            if "statuses" in value:
+                for status in value["statuses"]:
+                    if status.get("status") == "failed":
+                        print(f"[webhook] Message Delivery FAILED: {status}")
+                        return {"status": "ok"}
+            
             print(f"[webhook] Status update received — ignoring.")
             return {"status": "ok"}
 

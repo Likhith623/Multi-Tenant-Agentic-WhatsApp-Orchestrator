@@ -1,17 +1,23 @@
 """
 worker.py — Async background task executed by FastAPI BackgroundTasks.
 
-Flow:
-  1. Log the inbound message to the database.
-  2. Check if session needs a tenant selection (Routing Menu).
-  3. Check for concurrency lock (AGENT_RESPONDING = double-text guard).
-  4. Lock session → fire typing indicator → call LangGraph (Phase 3 placeholder).
-  5. Unlock session after response is dispatched.
+Responsibilities (pre-flight only):
+  1. Get or create the customer session.
+  2. Routing Menu — handle tenant selection for new users.
+  3. Concurrency guard — drop duplicate triggers when AGENT_RESPONDING.
+  4. Hand off to the 4-node LangGraph agent (agent.py).
+
+NOTE: All acknowledgement (read receipt, typing indicator, DB logging, and
+session locking) now happens inside the LangGraph Acknowledge Node, keeping
+the graph the single source of truth for the processing pipeline.
+
+A safety finally block is kept here as a last-resort crash guard to ensure
+the session is never permanently stuck in AGENT_RESPONDING.
 """
 
-import uuid
 from datetime import datetime, timezone
 
+import agent
 import db_client
 import whatsapp_client
 
@@ -40,12 +46,7 @@ async def process_inbound_message(
     """
 
     # -------------------------------------------------------------------------
-    # Step 1: Immediately send a read receipt so the user sees double blue ticks
-    # -------------------------------------------------------------------------
-    await whatsapp_client.mark_message_read(message_id)
-
-    # -------------------------------------------------------------------------
-    # Step 2: Get or create session for this phone number
+    # Step 1: Get or create session for this phone number
     # -------------------------------------------------------------------------
     session = await db_client.get_session_by_phone(from_phone)
 
@@ -55,32 +56,29 @@ async def process_inbound_message(
     session_id = session["id"]
 
     # -------------------------------------------------------------------------
-    # Step 3: Log the inbound message to the audit trail
-    # -------------------------------------------------------------------------
-    await db_client.insert_message(
-        message_id=message_id,
-        session_id=session_id,
-        direction="inbound",
-        content_type="text",
-        text_content=text_body,
-        timestamp=timestamp,
-    )
-
-    # -------------------------------------------------------------------------
-    # Step 4: Routing Menu — guide the user to select a tenant
+    # Step 2: Routing Menu — guide the user to select a tenant
+    # The LangGraph agent only runs AFTER a tenant has been assigned.
     # -------------------------------------------------------------------------
     tenant_id = session.get("tenant_id")
 
     if tenant_id is None:
-        # The user has not yet picked a tenant
+        # First, log this inbound message before responding to the menu
+        await db_client.insert_message(
+            message_id=message_id,
+            session_id=session_id,
+            direction="inbound",
+            content_type="text",
+            text_content=text_body,
+            timestamp=timestamp,
+        )
+
         user_choice = text_body.strip()
 
         if user_choice not in ("1", "2"):
-            # Unknown input — show the menu again
+            # Unknown input — show the routing menu again
             out_msg_id = await whatsapp_client.send_text_message(
                 from_phone, TENANT_MENU_MESSAGE
             )
-            # Log the outbound menu message
             if out_msg_id:
                 await db_client.insert_message(
                     message_id=out_msg_id,
@@ -91,7 +89,7 @@ async def process_inbound_message(
                 )
             return
 
-        # Valid selection — resolve tenant_id from the database
+        # Valid selection — resolve the tenant from the database
         all_tenants = await db_client.get_all_tenants()
         tenant_name_target = TENANT_SELECTION_MAP[user_choice]
         matched_tenant = next(
@@ -108,7 +106,7 @@ async def process_inbound_message(
         await db_client.set_session_tenant(session_id, matched_tenant["id"])
         tenant_id = matched_tenant["id"]
 
-        confirm_text = f"✅ Great! You're connected to *{matched_tenant['name']}* support. How can I help you today?"
+        confirm_text = f"✅ Great! You're now connected to *{matched_tenant['name']}* support. How can I help you today?"
         out_msg_id = await whatsapp_client.send_text_message(from_phone, confirm_text)
         if out_msg_id:
             await db_client.insert_message(
@@ -118,17 +116,16 @@ async def process_inbound_message(
                 content_type="text",
                 text_content=confirm_text,
             )
-        return  # Next message will be handled by LangGraph in Phase 3
+        return  # Next message will enter the full 4-node LangGraph pipeline
 
     # -------------------------------------------------------------------------
-    # Step 5: Concurrency guard — prevent duplicate processing from double-texts
+    # Step 3: Concurrency guard — prevent duplicate processing from double-texts
     # -------------------------------------------------------------------------
     current_status = session.get("status")
 
     if current_status == "AGENT_RESPONDING":
         # Another LangGraph run is already in progress for this session.
-        # Simply append this message to history and exit — the ongoing run
-        # will finish before the next message can trigger a new one.
+        # Drop this trigger — the ongoing run will finish first.
         print(
             f"[worker] Session {session_id} is AGENT_RESPONDING. "
             f"Dropping duplicate trigger for message {message_id}."
@@ -136,39 +133,30 @@ async def process_inbound_message(
         return
 
     # -------------------------------------------------------------------------
-    # Step 6: Lock the session and fire typing indicator
+    # Step 4: Hand off to the 4-node LangGraph agent
+    #
+    # The agent handles (in order):
+    #   Node 1 (Acknowledge)      → read receipt + typing ON + log inbound msg + lock session
+    #   Node 2 (Context Retriever)→ fetch tenant prompt + media library + chat history
+    #   Node 3 (LLM Reasoning)    → mistral-small-2506 decides text or tool call
+    #   Node 4 (Dispatcher)       → send reply + log outbound msg + typing OFF + unlock session
     # -------------------------------------------------------------------------
-    await db_client.update_session_status(session_id, "AGENT_RESPONDING")
-
-    # Fire typing indicator immediately AFTER locking so the user sees
-    # the "typing..." bubble during the entire LLM processing window.
-    await whatsapp_client.toggle_typing_indicator(from_phone, on=True)
-
     try:
-        # ---------------------------------------------------------------------
-        # Step 7: LangGraph Agent — PLACEHOLDER (implemented in Phase 3)
-        # ---------------------------------------------------------------------
-        # In Phase 3, this will be replaced with:
-        #   await langgraph_agent.run(session_id, tenant_id, from_phone, text_body)
-        #
-        # For now, send a placeholder reply to verify the full pipeline works.
-        placeholder_text = (
-            "🤖 _(Agent placeholder — LangGraph will take over in Phase 3)_\n\n"
-            f"I received your message: _{text_body}_"
+        await agent.run(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            from_phone=from_phone,
+            inbound_text=text_body,
+            message_id=message_id,
+            timestamp=timestamp,
         )
-        out_msg_id = await whatsapp_client.send_text_message(from_phone, placeholder_text)
-        if out_msg_id:
-            await db_client.insert_message(
-                message_id=out_msg_id,
-                session_id=session_id,
-                direction="outbound",
-                content_type="text",
-                text_content=placeholder_text,
-            )
 
-    finally:
-        # ---------------------------------------------------------------------
-        # Step 8: Always unlock the session — even if the LLM call crashes
-        # ---------------------------------------------------------------------
+    except Exception as e:
+        # -------------------------------------------------------------------------
+        # Safety net: If the graph crashes before the Dispatcher Node's finally
+        # block runs, ensure we still turn off typing and unlock the session.
+        # -------------------------------------------------------------------------
+        print(f"[worker] CRITICAL ERROR in LangGraph for session {session_id}: {e}")
         await whatsapp_client.toggle_typing_indicator(from_phone, on=False)
         await db_client.update_session_status(session_id, "WAITING_FOR_BOT")
+        raise

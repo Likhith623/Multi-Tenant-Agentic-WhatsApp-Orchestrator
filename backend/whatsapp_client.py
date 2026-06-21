@@ -84,9 +84,17 @@ async def send_image_message(to_phone: str, image_url: str, caption: str = "") -
         "image": {"link": image_url, "caption": caption},
     }
     async with httpx.AsyncClient() as client:
-        res = await client.post(_BASE_URL, json=payload, headers=_HEADERS)
-        data = res.json()
-        return data.get("messages", [{}])[0].get("id")
+        try:
+            res = await client.post(_BASE_URL, json=payload, headers=_HEADERS)
+            res.raise_for_status()
+            data = res.json()
+            return data.get("messages", [{}])[0].get("id")
+        except httpx.HTTPStatusError as e:
+            print(f"[whatsapp_client] Error sending image: {e.response.status_code} - {e.response.text}")
+            return None
+        except Exception as e:
+            print(f"[whatsapp_client] Exception sending image: {e}")
+            return None
 
 
 async def send_document_message(to_phone: str, doc_url: str, filename: str, caption: str = "") -> str | None:
@@ -101,6 +109,14 @@ async def send_document_message(to_phone: str, doc_url: str, filename: str, capt
         "document": {"link": doc_url, "filename": filename, "caption": caption},
     }
     async with httpx.AsyncClient() as client:
-        res = await client.post(_BASE_URL, json=payload, headers=_HEADERS)
-        data = res.json()
-        return data.get("messages", [{}])[0].get("id")
+        try:
+            res = await client.post(_BASE_URL, json=payload, headers=_HEADERS)
+            res.raise_for_status()
+            data = res.json()
+            return data.get("messages", [{}])[0].get("id")
+        except httpx.HTTPStatusError as e:
+            print(f"[whatsapp_client] Error sending document: {e.response.status_code} - {e.response.text}")
+            return None
+        except Exception as e:
+            print(f"[whatsapp_client] Exception sending document: {e}")
+            return None
