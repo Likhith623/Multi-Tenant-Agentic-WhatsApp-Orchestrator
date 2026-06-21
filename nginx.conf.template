@@ -1,0 +1,46 @@
+# nginx.conf.template
+#
+# This file is placed in /etc/nginx/conf.d/ which is included INSIDE the
+# http {} block of the main nginx.conf — so we must NOT include events {}
+# or http {} wrappers here. Only server {} blocks belong here.
+#
+# entrypoint.sh runs: envsubst '${PORT}' < template > conf.d/app.conf
+# Only ${PORT} is substituted; all nginx $variables are left untouched.
+
+server {
+    listen ${PORT};
+    server_name _;
+
+    # Allow large payloads (WhatsApp images / PDFs)
+    client_max_body_size 50M;
+
+    # ── FastAPI backend routes ─────────────────────────────────────────────
+    location /webhook {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host             $host;
+        proxy_set_header   X-Real-IP        $remote_addr;
+        proxy_set_header   X-Forwarded-For  $proxy_add_x_forwarded_for;
+        proxy_read_timeout 900s;
+    }
+
+    location /health {
+        proxy_pass http://127.0.0.1:8000;
+    }
+
+    # ── Next.js static assets ─────────────────────────────────────────────
+    location /_next/static/ {
+        proxy_pass http://127.0.0.1:3000;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    # ── Next.js dashboard (catch-all) ─────────────────────────────────────
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host       $host;
+        proxy_set_header   X-Real-IP  $remote_addr;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection upgrade;
+    }
+}

@@ -1,0 +1,72 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: project-10a50dcf-76cb-486e-9cc
+  REGION: us-central1
+  SERVICE: multi-tenant-agentic-whatsapp-orchestrator
+  REPOSITORY: cloud-run-source-deploy
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: projects/314402711320/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: krid-228@project-10a50dcf-76cb-486e-9cc.iam.gserviceaccount.com
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure Docker Authentication
+        run: |
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            --build-arg NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }} \
+            --build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }} \
+            -t us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${{ github.sha }} \
+            .
+
+      - name: Push Docker Image
+        run: |
+          docker push \
+            us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${{ github.sha }}
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE }} \
+            --image us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${{ github.sha }} \
+            --region=${{ env.REGION }} \
+            --platform=managed \
+            --allow-unauthenticated \
+            --service-account=krid-228@project-10a50dcf-76cb-486e-9cc.iam.gserviceaccount.com \
+            --memory=2Gi \
+            --cpu=2 \
+            --timeout=900 \
+            --max-instances=10 \
+            --set-env-vars="\
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }},\
+          SUPABASE_SECRET_KEY=${{ secrets.SUPABASE_SECRET_KEY }},\
+          WHATSAPP_TOKEN=${{ secrets.WHATSAPP_TOKEN }},\
+          WHATSAPP_PHONE_NUMBER_ID=${{ secrets.WHATSAPP_PHONE_NUMBER_ID }},\
+          WEBHOOK_VERIFY_TOKEN=${{ secrets.WEBHOOK_VERIFY_TOKEN }},\
+          MISTRAL_API_KEY=${{ secrets.MISTRAL_API_KEY }},\
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }},\
+          META_APP_SECRET=${{ secrets.META_APP_SECRET }}"
