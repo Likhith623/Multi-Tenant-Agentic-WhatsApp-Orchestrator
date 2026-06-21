@@ -11,7 +11,7 @@ permissions:
 
 env:
   PROJECT_ID: project-10a50dcf-76cb-486e-9cc
-  REGION: asia-south1
+  REGION: us-central1
   SERVICE: multi-tenant-agentic-whatsapp-orchestrator
   REPOSITORY: cloud-run-source-deploy
 
@@ -57,10 +57,11 @@ jobs:
             --platform=managed \
             --allow-unauthenticated \
             --service-account=krid-228@project-10a50dcf-76cb-486e-9cc.iam.gserviceaccount.com \
-            --memory=2Gi \
-            --cpu=2 \
+            --memory=4Gi \
+            --cpu=4 \
             --timeout=900 \
             --max-instances=10 \
+            --no-cpu-throttling \
             --set-env-vars="\
           SUPABASE_URL=${{ secrets.SUPABASE_URL }},\
           SUPABASE_SECRET_KEY=${{ secrets.SUPABASE_SECRET_KEY }},\
