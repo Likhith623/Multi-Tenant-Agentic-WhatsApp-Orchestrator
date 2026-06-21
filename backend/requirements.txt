@@ -4,7 +4,8 @@ supabase
 python-dotenv
 pydantic
 langgraph
-langchain-openai
 langchain-core
 langchain-mistralai
+langchain-google-genai
+google-generativeai
 httpx
