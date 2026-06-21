@@ -1,26 +1,103 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: 'Plus Jakarta Sans', sans-serif;
 }
+
+/* Typing Indicator Animation */
+.typing-dot {
+  animation: typing 1.4s infinite ease-in-out;
+  fill: currentColor;
+}
+.typing-dot:nth-child(1) { animation-delay: 0s; }
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes typing {
+  0%, 100% { transform: translateY(0); opacity: 0.5; }
+  50% { transform: translateY(-3px); opacity: 1; }
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background-color: rgba(165, 180, 252, 0.4);
+  border-radius: 10px;
+}
+
+/* Silk Gradient Mesh Background */
+.bg-mesh {
+  background-color: #f8fafc;
+  background-image:
+    radial-gradient(at 0% 0%, hsla(253,16%,7%,0) 0, transparent 50%),
+    radial-gradient(at 50% 0%, hsla(225,39%,30%,0.05) 0, transparent 50%),
+    radial-gradient(at 100% 0%, hsla(339,49%,30%,0.03) 0, transparent 50%),
+    radial-gradient(at 0% 100%, hsla(245,58%,30%,0.04) 0, transparent 50%),
+    radial-gradient(at 50% 100%, hsla(263,49%,30%,0.02) 0, transparent 50%),
+    radial-gradient(at 100% 100%, hsla(240,64%,30%,0.05) 0, transparent 50%);
+}
+
+/* Silk Neomorphic Classes */
+.silk-card {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  box-shadow: 0 4px 24px -2px rgba(99, 102, 241, 0.05), inset 0 1px 1px rgba(255, 255, 255, 0.8);
+}
+
+.silk-pressed {
+  background: rgba(248, 250, 252, 0.5);
+  box-shadow: inset 0 2px 4px rgba(99, 102, 241, 0.05), inset 0 1px 2px rgba(0, 0, 0, 0.02);
+  border: 1px solid transparent;
+}
+
+.silk-extruded {
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.08), 0 1px 2px rgba(99, 102, 241, 0.04), inset 0 1px 0 rgba(255,255,255,1);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+}
+
+.silk-gradient-text {
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-image: linear-gradient(135deg, #4338ca, #7c3aed);
+}
+
+/* Status Badges */
+.badge-needs-human {
+  background: linear-gradient(135deg, #fee2e2, #fecaca);
+  color: #b91c1c;
+  border: 1px solid rgba(252, 165, 165, 0.5);
+  box-shadow: 0 2px 4px rgba(239, 68, 68, 0.1);
+}
+
+.badge-waiting {
+  background: linear-gradient(135deg, #f1f5f9, #e2e8f0);
+  color: #475569;
+  border: 1px solid rgba(203, 213, 225, 0.5);
+}
+
+.badge-responding {
+  background: linear-gradient(135deg, #dcfce7, #bbf7d0);
+  color: #15803d;
+  border: 1px solid rgba(134, 239, 172, 0.5);
+  box-shadow: 0 2px 4px rgba(34, 197, 94, 0.1);
+}
+
+.badge-resolved {
+  background: linear-gradient(135deg, #10b981, #059669);
+  color: white;
+  box-shadow: 0 2px 4px rgba(16, 185, 129, 0.2);
+}
+
+/* Broadcast Drawer Overlay */
+.drawer-overlay {
+  background: rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(4px);
+}
+
+/* No scrollbar utility */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
