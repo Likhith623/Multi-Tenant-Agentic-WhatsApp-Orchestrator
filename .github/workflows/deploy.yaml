@@ -36,6 +36,13 @@ jobs:
         run: |
           gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
 
+      - name: Create Artifact Registry Repository (if missing)
+        run: |
+          gcloud artifacts repositories create ${{ env.REPOSITORY }} \
+            --repository-format=docker \
+            --location=${{ env.REGION }} \
+            --description="Docker repository for Cloud Run" || true
+
       - name: Build Docker Image
         run: |
           docker build \
