@@ -5,8 +5,15 @@ Exposes:
   GET  /webhook  — Meta webhook verification challenge handler
   POST /webhook  — Inbound WhatsApp message ingress (fires BackgroundTask)
   GET  /health   — Basic health check
+
+Security:
+  All POST /webhook requests are validated against the X-Hub-Signature-256
+  header using HMAC-SHA256 with the META_APP_SECRET. Requests without a
+  valid signature are rejected with HTTP 401.
 """
 
+import hashlib
+import hmac
 import os
 from datetime import datetime, timezone
 
@@ -21,6 +28,7 @@ load_dotenv()
 app = FastAPI(title="Multi-Tenant WhatsApp Orchestrator")
 
 VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN", "")
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +61,41 @@ async def verify_webhook(
 
 
 # ---------------------------------------------------------------------------
+# Webhook Signature Validation
+# ---------------------------------------------------------------------------
+
+def _validate_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    """
+    Validates the X-Hub-Signature-256 header sent by Meta.
+
+    Meta computes: HMAC-SHA256(APP_SECRET, raw_request_body)
+    We recompute the same hash and compare using hmac.compare_digest
+    (constant-time comparison to prevent timing attacks).
+
+    Returns True if the signature is valid, False otherwise.
+    """
+    if not META_APP_SECRET:
+        # If the secret is not configured, skip validation (dev mode)
+        print("[webhook] WARNING: META_APP_SECRET not set — skipping signature check.")
+        return True
+
+    if not signature_header or not signature_header.startswith("sha256="):
+        print("[webhook] SECURITY: Missing or malformed X-Hub-Signature-256 header.")
+        return False
+
+    expected_sig = "sha256=" + hmac.new(
+        META_APP_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    is_valid = hmac.compare_digest(expected_sig, signature_header)
+    if not is_valid:
+        print(f"[webhook] SECURITY: Signature mismatch! Expected={expected_sig[:30]}..., Got={signature_header[:30]}...")
+    return is_valid
+
+
+# ---------------------------------------------------------------------------
 # Inbound Message Handler (POST)
 # ---------------------------------------------------------------------------
 
@@ -61,17 +104,32 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Main webhook receiver.
 
+    SECURITY: Validates X-Hub-Signature-256 before processing.
+
     CRITICAL — The "Status Update" Trap:
     Meta fires webhooks for every status change (sent, delivered, read).
     These payloads do NOT contain a 'messages' array. We must guard against
     this to prevent a KeyError crash when parsing the payload.
 
     Strategy:
+    - Reject payloads with invalid signatures → HTTP 401.
     - If the payload is a status update → silently return 200 OK.
     - If it contains a real user message → parse, return 200 OK immediately,
       then hand off to the background worker (FastAPI BackgroundTasks).
     """
-    payload = await request.json()
+    # --- Step 1: Read raw bytes BEFORE parsing JSON (needed for signature check) ---
+    raw_body = await request.body()
+
+    # --- Step 2: Validate the HMAC-SHA256 signature ---
+    signature_header = request.headers.get("X-Hub-Signature-256")
+    if not _validate_signature(raw_body, signature_header):
+        # Return 401 to signal rejection, but log it. Never return 4xx for
+        # status updates — only for genuine security violations.
+        raise HTTPException(status_code=401, detail="Invalid webhook signature.")
+
+    # --- Step 3: Parse JSON from the already-read raw bytes ---
+    import json
+    payload = json.loads(raw_body)
 
     try:
         # Safely navigate the deeply nested Meta payload structure
@@ -79,53 +137,53 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
         # --- Guard: Check if this is a status update, not a user message ---
         if "messages" not in value:
-            # This is a status update (sent/delivered/read notification).
-            # If it's a failed status, let's log the error.
             if "statuses" in value:
                 for status in value["statuses"]:
                     if status.get("status") == "failed":
                         print(f"[webhook] Message Delivery FAILED: {status}")
                         return {"status": "ok"}
-            
+
             print(f"[webhook] Status update received — ignoring.")
             return {"status": "ok"}
 
         # --- It's a real user message — extract the data ---
         message_data = value["messages"][0]
-        phone_number_id = value["metadata"]["phone_number_id"]
+        message_type: str = message_data.get("type", "text")
 
-        # Only process text messages for now (Phase 3 adds media handling)
-        if message_data.get("type") != "text":
-            print(f"[webhook] Non-text message type received: {message_data.get('type')} — ignoring.")
+        # Only process text and image messages
+        if message_type not in ("text", "image"):
+            print(f"[webhook] Unsupported message type: {message_type} — ignoring.")
             return {"status": "ok"}
 
         message_id: str = message_data["id"]
         from_phone: str = message_data["from"]
-        text_body: str = message_data["text"]["body"]
-        # Meta sends timestamp as a Unix epoch string
         timestamp = datetime.fromtimestamp(
             int(message_data["timestamp"]), tz=timezone.utc
         )
 
-        print(
-            f"[webhook] New message from {from_phone}: '{text_body}' "
-            f"(msg_id={message_id})"
-        )
+        # Extract content depending on type
+        if message_type == "text":
+            text_body: str = message_data["text"]["body"]
+            media_id: str | None = None
+            print(f"[webhook] New text from {from_phone}: '{text_body}' (msg_id={message_id})")
+        else:
+            # Image message — text_body is the optional caption
+            text_body = message_data.get("image", {}).get("caption", "")
+            media_id = message_data.get("image", {}).get("id")
+            print(f"[webhook] New image from {from_phone} (media_id={media_id}, caption='{text_body}')")
 
         # --- Dispatch to background worker — DO NOT AWAIT ---
-        # FastAPI's BackgroundTasks runs after the HTTP response is returned,
-        # satisfying Meta's 3-second timeout requirement.
         background_tasks.add_task(
             worker.process_inbound_message,
             message_id=message_id,
             from_phone=from_phone,
             text_body=text_body,
             timestamp=timestamp,
+            message_type=message_type,
+            media_id=media_id,
         )
 
     except (KeyError, IndexError, TypeError) as e:
-        # Malformed or unexpected payload shape — log and return 200 OK
-        # (Never return 4xx to Meta, or it will keep retrying)
         print(f"[webhook] Failed to parse payload: {e}. Payload: {payload}")
 
     # Always return 200 OK immediately to Meta

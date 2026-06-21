@@ -8,7 +8,7 @@ Exactly matches the assignment's Task 3 diagram:
         v
   ┌─────────────────────┐
   │  Acknowledge Node   │──► Send Read Receipt + Typing ON + Save Inbound Msg to DB
-  └─────────────────────┘
+  └─────────────────────┘     (If image: download media bytes for multimodal analysis)
         |
         v
   ┌─────────────────────────┐
@@ -17,17 +17,22 @@ Exactly matches the assignment's Task 3 diagram:
         |
         v
   ┌─────────────────────┐
-  │  LLM Reasoning Node │──► Choose response type & assets (text or tool call)
-  └─────────────────────┘
+  │  LLM Reasoning Node │──► Gemini 1.5 Pro (multimodal) decides response type
+  └─────────────────────┘     Analyses sentiment → can trigger escalate_to_human
         |
         v
   ┌──────────────────┐
-  │  Dispatcher Node │──► Send Text/Image/Doc + Save State + Typing OFF
+  │  Dispatcher Node │──► Send Text/Image/Doc/Escalation + Save State + Typing OFF
   └──────────────────┘
 
 State flows as a TypedDict, accumulating data across all 4 nodes.
+
+LLM: Google Gemini 1.5 Pro via langchain-google-genai
+  - Supports native multimodal (text + image) inputs
+  - Tool calling for attach_media and escalate_to_human
 """
 
+import base64
 import os
 from typing import TypedDict, Any
 from datetime import datetime, timezone
@@ -36,6 +41,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.tools import tool
 from langchain_mistralai import ChatMistralAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 
 import db_client
@@ -48,15 +54,26 @@ load_dotenv()
 # LLM Setup
 # ---------------------------------------------------------------------------
 
+# Primary LLM: Mistral Small — handles all conversational reasoning & tool calls
 _llm = ChatMistralAI(
     model="mistral-small-2506",
     api_key=os.environ["MISTRAL_API_KEY"],
     temperature=0.4,
 )
 
+# Vision Preprocessor: Gemini 2.0 Flash Lite — converts inbound images into
+# a rich text description that is then fed into Mistral as context.
+# This keeps Mistral as the single reasoning engine while gaining vision.
+_vision_llm = ChatGoogleGenerativeAI(
+    model="gemini-3.1-flash-lite",
+    google_api_key=os.environ["GEMINI_API_KEY"],
+    temperature=0.2,  # Low temp for factual image description
+    convert_system_message_to_human=True,
+)
+
 
 # ---------------------------------------------------------------------------
-# Tool Definition
+# Tool Definitions
 # ---------------------------------------------------------------------------
 
 @tool
@@ -67,13 +84,24 @@ def attach_media(keyword: str) -> str:
     Pass the exact keyword that matches the media the user requested.
     Do NOT use markdown links — always use this tool for files.
     """
-    # The actual dispatch happens in the dispatcher node.
-    # This function body is never called at runtime — the tool signature
-    # is only used by the LLM to understand what it can invoke.
     return keyword
 
 
-_tools = [attach_media]
+@tool
+def escalate_to_human(reason: str) -> str:
+    """
+    Use this tool ONLY when the user expresses clear frustration, anger,
+    or explicitly requests to speak with a human agent. This will halt all
+    automated replies and flag the conversation for immediate human review.
+
+    Args:
+        reason: A brief summary of why the conversation is being escalated
+                (e.g., "User is frustrated about delivery delay").
+    """
+    return reason
+
+
+_tools = [attach_media, escalate_to_human]
 _llm_with_tools = _llm.bind_tools(_tools)
 
 
@@ -87,11 +115,13 @@ class AgentState(TypedDict):
     tenant_id: str
     from_phone: str
     inbound_text: str
-    message_id: str          # Original WhatsApp message ID (for read receipt)
-    timestamp: datetime      # Inbound message timestamp (for DB audit log)
+    message_id: str           # Original WhatsApp message ID (for read receipt)
+    timestamp: datetime       # Inbound message timestamp (for DB audit log)
+    message_type: str         # "text" or "image"
+    media_id: str | None      # WhatsApp Media ID (for image messages)
 
     # --- Populated by: Acknowledge Node ---
-    # (no new fields; it performs side effects directly)
+    inbound_image_b64: str | None  # Base64-encoded image bytes (if image message)
 
     # --- Populated by: Context Retriever Node ---
     tenant_name: str
@@ -112,10 +142,9 @@ async def acknowledge_node(state: AgentState) -> AgentState:
     Immediately acknowledges the inbound message by:
       1. Sending a read receipt → user sees double blue ticks.
       2. Turning on the typing indicator → user sees 'typing...' bubble.
-      3. Saving the inbound message to the database as PENDING_RESPONSE.
+      3. Saving the inbound message to the database.
       4. Locking the session (status = AGENT_RESPONDING).
-
-    All subsequent nodes run while the user sees the typing indicator.
+      5. [If image] Downloading and base64-encoding the image for Gemini.
     """
     print(f"[agent:acknowledge] Processing message {state['message_id']} from {state['from_phone']}")
 
@@ -125,20 +154,31 @@ async def acknowledge_node(state: AgentState) -> AgentState:
     # 2. Fire typing indicator — user sees 'typing...' immediately
     await whatsapp_client.toggle_typing_indicator(state["from_phone"], on=True)
 
-    # 3. Save the inbound message to the database audit log
+    # 3. Save the inbound message to the database
     await db_client.insert_message(
         message_id=state["message_id"],
         session_id=state["session_id"],
         direction="inbound",
-        content_type="text",
-        text_content=state["inbound_text"],
+        content_type=state["message_type"],
+        text_content=state["inbound_text"] or f"[{state['message_type']} message]",
         timestamp=state["timestamp"],
     )
 
     # 4. Lock the session to prevent concurrent double-text processing
     await db_client.update_session_status(state["session_id"], "AGENT_RESPONDING")
 
-    return state
+    # 5. If this is an image message, download and base64-encode for Gemini
+    inbound_image_b64: str | None = None
+    if state["message_type"] == "image" and state["media_id"]:
+        print(f"[agent:acknowledge] Downloading image media_id={state['media_id']}")
+        image_bytes = await whatsapp_client.download_media(state["media_id"])
+        if image_bytes:
+            inbound_image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            print(f"[agent:acknowledge] Image downloaded: {len(image_bytes)} bytes → base64 encoded")
+        else:
+            print(f"[agent:acknowledge] WARNING: Could not download image media_id={state['media_id']}")
+
+    return {**state, "inbound_image_b64": inbound_image_b64}
 
 
 # ---------------------------------------------------------------------------
@@ -181,18 +221,24 @@ async def context_retriever_node(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
-# Node 3: LLM Reasoning Node
+# Node 3: LLM Reasoning Node (Gemini Multimodal)
 # ---------------------------------------------------------------------------
 
 async def llm_reasoning_node(state: AgentState) -> AgentState:
     """
-    Invokes mistral-small-2506 to determine the next conversational step.
+    Invokes Google Gemini 1.5 Pro to determine the next conversational step.
 
     Agentic Decision-Making:
       The LLM decides whether to:
-        (a) Reply with a plain text string, OR
-        (b) Trigger the attach_media tool to send a document/image from
-            the Tenant's media library when the user requests visual/data assets.
+        (a) Reply with a plain text string.
+        (b) Trigger the attach_media tool to send a document/image asset.
+        (c) Trigger the escalate_to_human tool if the user is frustrated.
+
+    Multimodal Input:
+      If the inbound message is an image, it is passed as a base64-encoded
+      image_url block in the HumanMessage content alongside the caption text.
+      Gemini natively processes this to describe the image in the context of
+      the tenant's business.
     """
     media_library: dict = state["media_library"]
     media_keywords = list(media_library.keys())
@@ -210,21 +256,86 @@ IMPORTANT FORMATTING RULES:
 AVAILABLE MEDIA ASSETS (keywords you can pass to attach_media):
 {', '.join(media_keywords) if media_keywords else 'No media assets available.'}
 
-Use the attach_media tool only when the user clearly requests one of these assets.
+SENTIMENT ANALYSIS & ESCALATION RULES:
+- Assess the user's emotional state in every message.
+- If the user expresses CLEAR frustration, anger, repeated complaints, or
+  EXPLICITLY asks to speak with a human (e.g., "I want to talk to a real person",
+  "this is ridiculous", "I'm so angry"), you MUST use the escalate_to_human tool.
+- Do NOT escalate for minor complaints or simple confusion — only for genuine distress.
+
+IMAGE HANDLING:
+- If you receive an image, describe what you see in the context of the business.
+- Identify if it's a product, damage claim, or relevant inquiry and respond accordingly.
 """
+
+    # ── Vision Preprocessing (if image) ────────────────────────────────────────
+    # Step 1: If an image was received, call Gemini Flash Lite first to get a
+    #         rich text description in the context of the tenant's business.
+    # Step 2: Inject that description into the Mistral conversation as context.
+    # This gives Mistral "eyes" without needing to be a multimodal model itself.
+    if state.get("inbound_image_b64"):
+        print(f"[agent:llm_reasoning] 🖼️ Running vision preprocessor (Gemini Flash Lite)...")
+        vision_prompt = (
+            f"You are a vision assistant for {state['tenant_name']}. "
+            f"A customer sent this image on WhatsApp. "
+            f"Describe what you see clearly and concisely, focusing on details "
+            f"relevant to a {state['tenant_name']} business context. "
+            f"If the image shows a product, damage, receipt, or document, "
+            f"mention it specifically. Keep the description under 3 sentences."
+        )
+        caption = state["inbound_text"]
+        vision_content = [
+            {"type": "text", "text": vision_prompt},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{state['inbound_image_b64']}"},
+            },
+        ]
+        try:
+            vision_response = await _vision_llm.ainvoke(
+                [HumanMessage(content=vision_content)]
+            )
+            # Gemini can return content as a plain string OR as a list of
+            # content blocks e.g. [{"type": "text", "text": "..."}].
+            # Handle both formats.
+            raw = vision_response.content
+            if isinstance(raw, list):
+                image_description = " ".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in raw
+                ).strip()
+            else:
+                image_description = str(raw).strip()
+            print(f"[agent:llm_reasoning] 🖼️ Gemini description: {image_description[:120]}...")
+        except Exception as e:
+            print(f"[agent:llm_reasoning] ⚠️ Vision preprocessor failed: {e}")
+            image_description = "the customer sent an image (could not be analysed)"
+
+        # Build the enriched text message for Mistral, combining the image
+        # description with any caption the user added
+        if caption:
+            inbound_human_msg = HumanMessage(
+                content=f"[Image received — Vision AI description: {image_description}]\nCustomer caption: {caption}"
+            )
+        else:
+            inbound_human_msg = HumanMessage(
+                content=f"[Image received — Vision AI description: {image_description}]"
+            )
+    else:
+        inbound_human_msg = HumanMessage(content=state["inbound_text"])
 
     # Build full message list: system prompt + conversation history + new message
     messages: list[BaseMessage] = (
         [SystemMessage(content=system_prompt)]
         + state["chat_history"]
-        + [HumanMessage(content=state["inbound_text"])]
+        + [inbound_human_msg]
     )
 
     ai_message: AIMessage = await _llm_with_tools.ainvoke(messages)
 
     print(
-        f"[agent:llm_reasoning] content='{ai_message.content}' | "
-        f"tool_calls={ai_message.tool_calls}"
+        f"[agent:llm_reasoning] content='{ai_message.content[:80] if ai_message.content else ''}...' | "
+        f"tool_calls={[tc['name'] for tc in ai_message.tool_calls]}"
     )
 
     return {**state, "ai_message": ai_message}
@@ -236,13 +347,14 @@ Use the attach_media tool only when the user clearly requests one of these asset
 
 async def dispatcher_node(state: AgentState) -> AgentState:
     """
-    Constructs the appropriate WhatsApp payload (text, image, or document)
-    and sends it. Then records the outgoing response in the database and
+    Constructs the appropriate WhatsApp payload and sends it.
+    Then records the outgoing response in the database and
     automatically extinguishes the typing indicator.
 
     Routing logic:
-      - ai_message.tool_calls populated → send media (image or document)
-      - ai_message.content populated   → send plain text
+      - escalate_to_human tool call → set NEEDS_HUMAN, send farewell, HALT
+      - attach_media tool call      → send media (image or document)
+      - ai_message.content          → send plain text
     """
     ai_message: AIMessage = state["ai_message"]
     from_phone = state["from_phone"]
@@ -250,18 +362,44 @@ async def dispatcher_node(state: AgentState) -> AgentState:
     media_library: dict = state["media_library"]
 
     try:
-        # -------------------------------------------------------------------------
-        # CASE 1: Tool call triggered — LLM wants to send a media asset
-        # When Mistral fires a tool, content is often empty; payload is in tool_calls.
-        # -------------------------------------------------------------------------
         if ai_message.tool_calls:
             for tool_call in ai_message.tool_calls:
-                if tool_call["name"] == "attach_media":
+
+                # -------------------------------------------------------------
+                # CASE 1: Escalation — LLM detected user frustration
+                # -------------------------------------------------------------
+                if tool_call["name"] == "escalate_to_human":
+                    reason = tool_call["args"].get("reason", "User requested human agent.")
+                    print(f"[agent:dispatcher] 🚨 ESCALATING to human: {reason}")
+
+                    farewell = (
+                        "I understand your frustration and I sincerely apologise. "
+                        "I've escalated this conversation to one of our human agents "
+                        "who will be with you shortly. 🙏"
+                    )
+                    out_id = await whatsapp_client.send_text_message(from_phone, farewell)
+                    if out_id:
+                        await db_client.insert_message(
+                            message_id=out_id,
+                            session_id=session_id,
+                            direction="outbound",
+                            content_type="text",
+                            text_content=farewell,
+                        )
+
+                    # Set status to NEEDS_HUMAN — worker.py will halt all future auto-replies
+                    await db_client.update_session_status(session_id, "NEEDS_HUMAN")
+                    print(f"[agent:dispatcher] Session {session_id} → NEEDS_HUMAN")
+                    return state  # Skip the finally block's status reset
+
+                # -------------------------------------------------------------
+                # CASE 2: Media attachment — LLM wants to send an asset
+                # -------------------------------------------------------------
+                elif tool_call["name"] == "attach_media":
                     keyword = tool_call["args"].get("keyword", "").lower().strip()
                     media_url = media_library.get(keyword)
 
                     if media_url is None:
-                        # Keyword not in tenant's library — graceful fallback
                         fallback = f"I'm sorry, I don't have a media asset for '{keyword}' at this time."
                         out_id = await whatsapp_client.send_text_message(from_phone, fallback)
                         if out_id:
@@ -274,9 +412,10 @@ async def dispatcher_node(state: AgentState) -> AgentState:
                             )
                         continue
 
-                    # Determine media type from file extension
                     caption = f"Here is your {keyword}."
-                    if media_url.lower().endswith(".pdf"):
+
+                    # Determine media type by file extension
+                    if media_url.lower().endswith(".pdf") or "export=download" in media_url.lower():
                         out_id = await whatsapp_client.send_document_message(
                             from_phone,
                             doc_url=media_url,
@@ -285,7 +424,6 @@ async def dispatcher_node(state: AgentState) -> AgentState:
                         )
                         content_type = "document"
                     else:
-                        # jpg / png / jpeg — treat as image
                         out_id = await whatsapp_client.send_image_message(
                             from_phone,
                             image_url=media_url,
@@ -305,9 +443,9 @@ async def dispatcher_node(state: AgentState) -> AgentState:
                             media_url=media_url,
                         )
 
-        # -------------------------------------------------------------------------
-        # CASE 2: Plain text response — content attribute is populated
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # CASE 3: Plain text response
+        # ---------------------------------------------------------------------
         else:
             text_response = (ai_message.content or "").strip()
 
@@ -326,11 +464,15 @@ async def dispatcher_node(state: AgentState) -> AgentState:
                 print(f"[agent:dispatcher] WARNING: LLM returned empty content and no tool calls.")
 
     finally:
-        # Always extinguish the typing indicator and unlock the session,
-        # even if sending the message fails.
+        # Always extinguish the typing indicator, even if sending fails.
+        # But only reset status to WAITING_FOR_BOT if it wasn't set to NEEDS_HUMAN.
         await whatsapp_client.toggle_typing_indicator(from_phone, on=False)
-        await db_client.update_session_status(session_id, "WAITING_FOR_BOT")
-        print(f"[agent:dispatcher] Session {session_id} unlocked → WAITING_FOR_BOT")
+
+        # Re-read the current status to avoid overwriting NEEDS_HUMAN
+        current_session = await db_client.get_session_by_phone(from_phone)
+        if current_session and current_session.get("status") != "NEEDS_HUMAN":
+            await db_client.update_session_status(session_id, "WAITING_FOR_BOT")
+            print(f"[agent:dispatcher] Session {session_id} unlocked → WAITING_FOR_BOT")
 
     return state
 
@@ -372,6 +514,8 @@ async def run(
     inbound_text: str,
     message_id: str,
     timestamp: datetime,
+    message_type: str = "text",
+    media_id: str | None = None,
 ) -> None:
     """
     Entry point called by worker.py after routing and concurrency checks pass.
@@ -384,7 +528,10 @@ async def run(
         "inbound_text": inbound_text,
         "message_id": message_id,
         "timestamp": timestamp,
+        "message_type": message_type,
+        "media_id": media_id,
         # Populated by nodes:
+        "inbound_image_b64": None,
         "tenant_name": "",
         "tenant_prompt": "",
         "media_library": {},

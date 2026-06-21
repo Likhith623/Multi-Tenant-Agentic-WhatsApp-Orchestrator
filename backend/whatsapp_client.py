@@ -120,3 +120,47 @@ async def send_document_message(to_phone: str, doc_url: str, filename: str, capt
         except Exception as e:
             print(f"[whatsapp_client] Exception sending document: {e}")
             return None
+
+
+async def download_media(media_id: str) -> bytes | None:
+    """
+    Downloads raw media bytes from Meta's servers using a two-step process:
+
+    Step 1: Retrieve the temporary media URL.
+      GET https://graph.facebook.com/v20.0/{media_id}
+      Returns: {"url": "https://...", "mime_type": "image/jpeg", ...}
+
+    Step 2: Download the binary data from the temporary URL.
+      The download request MUST include the Authorization header,
+      otherwise Meta returns a 403.
+
+    Returns raw bytes on success, or None on failure.
+    """
+    media_api_url = f"https://graph.facebook.com/v20.0/{media_id}"
+    auth_headers = {"Authorization": f"Bearer {_TOKEN}"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            # Step 1: Get the temporary download URL
+            meta_response = await client.get(media_api_url, headers=auth_headers)
+            meta_response.raise_for_status()
+            media_info = meta_response.json()
+            download_url = media_info.get("url")
+
+            if not download_url:
+                print(f"[whatsapp_client] No URL returned for media_id={media_id}: {media_info}")
+                return None
+
+            print(f"[whatsapp_client] Downloading media from {download_url[:60]}...")
+
+            # Step 2: Download the actual binary data
+            media_response = await client.get(download_url, headers=auth_headers)
+            media_response.raise_for_status()
+            return media_response.content
+
+        except httpx.HTTPStatusError as e:
+            print(f"[whatsapp_client] Error downloading media {media_id}: {e.response.status_code} - {e.response.text}")
+            return None
+        except Exception as e:
+            print(f"[whatsapp_client] Exception downloading media {media_id}: {e}")
+            return None

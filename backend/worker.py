@@ -39,10 +39,20 @@ async def process_inbound_message(
     from_phone: str,
     text_body: str,
     timestamp: datetime,
+    message_type: str = "text",
+    media_id: str | None = None,
 ) -> None:
     """
     Main background worker. Called by the FastAPI POST /webhook route.
     All heavy lifting happens here, safely outside the 3-second HTTP window.
+
+    Args:
+        message_id:   WhatsApp message ID (wamid.xxx)
+        from_phone:   Sender's phone number (e.g. "917993701604")
+        text_body:    Text content or image caption (may be empty for images)
+        timestamp:    Message timestamp parsed from Unix epoch
+        message_type: "text" or "image"
+        media_id:     WhatsApp Media ID for image messages (None for text)
     """
 
     # -------------------------------------------------------------------------
@@ -67,11 +77,12 @@ async def process_inbound_message(
             message_id=message_id,
             session_id=session_id,
             direction="inbound",
-            content_type="text",
-            text_content=text_body,
+            content_type=message_type,
+            text_content=text_body or f"[{message_type} message]",
             timestamp=timestamp,
         )
 
+        # For image messages sent before tenant selection, prompt for selection
         user_choice = text_body.strip()
 
         if user_choice not in ("1", "2"):
@@ -132,13 +143,30 @@ async def process_inbound_message(
         )
         return
 
+    # Halt auto-replies for sessions that have been escalated to a human agent
+    if current_status == "NEEDS_HUMAN":
+        print(
+            f"[worker] Session {session_id} is NEEDS_HUMAN. "
+            f"Halting auto-reply — awaiting human takeover."
+        )
+        # Still log the inbound message to the database for the human agent to see
+        await db_client.insert_message(
+            message_id=message_id,
+            session_id=session_id,
+            direction="inbound",
+            content_type=message_type,
+            text_content=text_body or f"[{message_type} message]",
+            timestamp=timestamp,
+        )
+        return
+
     # -------------------------------------------------------------------------
     # Step 4: Hand off to the 4-node LangGraph agent
     #
     # The agent handles (in order):
     #   Node 1 (Acknowledge)      → read receipt + typing ON + log inbound msg + lock session
     #   Node 2 (Context Retriever)→ fetch tenant prompt + media library + chat history
-    #   Node 3 (LLM Reasoning)    → mistral-small-2506 decides text or tool call
+    #   Node 3 (LLM Reasoning)    → Gemini decides text/tool call/escalation
     #   Node 4 (Dispatcher)       → send reply + log outbound msg + typing OFF + unlock session
     # -------------------------------------------------------------------------
     try:
@@ -149,6 +177,8 @@ async def process_inbound_message(
             inbound_text=text_body,
             message_id=message_id,
             timestamp=timestamp,
+            message_type=message_type,
+            media_id=media_id,
         )
 
     except Exception as e:
