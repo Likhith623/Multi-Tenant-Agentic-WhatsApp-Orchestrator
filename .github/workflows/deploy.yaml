@@ -62,12 +62,4 @@ jobs:
             --timeout=900 \
             --max-instances=10 \
             --no-cpu-throttling \
-            --set-env-vars="\
-          SUPABASE_URL=${{ secrets.SUPABASE_URL }},\
-          SUPABASE_SECRET_KEY=${{ secrets.SUPABASE_SECRET_KEY }},\
-          WHATSAPP_TOKEN=${{ secrets.WHATSAPP_TOKEN }},\
-          WHATSAPP_PHONE_NUMBER_ID=${{ secrets.WHATSAPP_PHONE_NUMBER_ID }},\
-          WEBHOOK_VERIFY_TOKEN=${{ secrets.WEBHOOK_VERIFY_TOKEN }},\
-          MISTRAL_API_KEY=${{ secrets.MISTRAL_API_KEY }},\
-          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }},\
-          META_APP_SECRET=${{ secrets.META_APP_SECRET }}"
+            --set-env-vars="SUPABASE_URL=${{ secrets.SUPABASE_URL }},SUPABASE_SECRET_KEY=${{ secrets.SUPABASE_SECRET_KEY }},WHATSAPP_TOKEN=${{ secrets.WHATSAPP_TOKEN }},WHATSAPP_PHONE_NUMBER_ID=${{ secrets.WHATSAPP_PHONE_NUMBER_ID }},WEBHOOK_VERIFY_TOKEN=${{ secrets.WEBHOOK_VERIFY_TOKEN }},MISTRAL_API_KEY=${{ secrets.MISTRAL_API_KEY }},GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }},META_APP_SECRET=${{ secrets.META_APP_SECRET }}"
