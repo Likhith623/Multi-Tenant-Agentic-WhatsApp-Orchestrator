@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 import worker
@@ -188,3 +189,48 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
     # Always return 200 OK immediately to Meta
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Broadcast Campaign API (POST)
+# ---------------------------------------------------------------------------
+
+class BroadcastRequest(BaseModel):
+    tenant_id: str
+    template_name: str
+    phone_numbers: list[str]
+
+
+@app.post("/api/broadcast")
+async def trigger_broadcast(req: BroadcastRequest):
+    """
+    Triggers a WhatsApp template broadcast to a list of phone numbers.
+    Used by the frontend Broadcast Campaign Drawer.
+    """
+    import db_client
+    import whatsapp_client
+
+    tenant = await db_client.get_tenant_by_id(req.tenant_id)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    results = {"success": [], "failed": []}
+
+    for phone in req.phone_numbers:
+        msg_id = await whatsapp_client.send_template_message(phone, req.template_name)
+        if msg_id:
+            # We log this in the database to maintain history
+            # Generate a pseudo session ID for the broadcast thread
+            session_id = f"broadcast_{req.tenant_id}_{phone}"
+            await db_client.insert_message(
+                message_id=msg_id,
+                session_id=session_id,
+                direction="outbound",
+                content_type="text",
+                text_content=f"[Broadcast Template Sent: {req.template_name}]",
+            )
+            results["success"].append(phone)
+        else:
+            results["failed"].append(phone)
+
+    return {"status": "completed", "results": results}

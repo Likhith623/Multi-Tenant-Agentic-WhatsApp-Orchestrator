@@ -15,34 +15,60 @@ _HEADERS = {
 
 async def mark_message_read(message_id: str) -> None:
     """
-    Send a read receipt to Meta for the given message ID.
-    This marks the message as read on the user's phone (double blue ticks).
+    Send a read receipt to Meta for the given message ID, AND start the
+    native typing indicator simultaneously.
+
+    Per Meta's official documentation, the typing indicator is triggered by
+    including `typing_indicator: {type: 'text'}` inside the same read-receipt
+    payload (status='read'). This is the ONLY supported way to show a typing
+    bubble on the customer's WhatsApp device.
+
+    The indicator stays visible for up to 25 seconds or until we send the
+    actual reply — whichever comes first.
     """
     payload = {
         "messaging_product": "whatsapp",
         "status": "read",
         "message_id": message_id,
+        "typing_indicator": {"type": "text"},
     }
     async with httpx.AsyncClient() as client:
-        await client.post(_BASE_URL, json=payload, headers=_HEADERS)
+        try:
+            res = await client.post(_BASE_URL, json=payload, headers=_HEADERS)
+            if res.status_code != 200:
+                print(f"[whatsapp_client] Read receipt+typing failed: {res.status_code} - {res.text}")
+            else:
+                print(f"[whatsapp_client] Read receipt + typing indicator sent for {message_id}")
+        except Exception as e:
+            print(f"[whatsapp_client] Exception sending read receipt: {e}")
 
 
 async def toggle_typing_indicator(to_phone: str, on: bool = True) -> None:
     """
-    Start or stop the native WhatsApp typing indicator ("typing...").
-    Call with on=True before LLM processing, on=False after sending the reply.
-    Note: WhatsApp automatically clears the indicator after ~25 seconds,
-    but explicitly turning it off is good hygiene.
+    Explicitly stop the typing indicator once the reply has been sent.
+    Calling with on=False sends `type: 'pause'` to clear the bubble.
+
+    NOTE: Starting the typing indicator is now handled inside mark_message_read()
+    using the combined read-receipt payload. Only call this directly to STOP it.
+    The indicator auto-clears after 25 seconds anyway, so this is just hygiene.
     """
+    if on:
+        # Starting is handled by mark_message_read — nothing to do here.
+        return
+
     payload = {
         "messaging_product": "whatsapp",
-        "recipient_type": "individual",
+        "status": "read",
+        "typing_indicator": {"type": "pause"},
         "to": to_phone,
-        "type": "typing_indicator",
-        "typing_indicator": {"type": "text" if on else "pause"},
     }
     async with httpx.AsyncClient() as client:
-        await client.post(_BASE_URL, json=payload, headers=_HEADERS)
+        try:
+            res = await client.post(_BASE_URL, json=payload, headers=_HEADERS)
+            if res.status_code != 200:
+                print(f"[whatsapp_client] Typing stop failed: {res.status_code} - {res.text}")
+        except Exception as e:
+            print(f"[whatsapp_client] Exception stopping typing indicator: {e}")
 
 
 async def send_text_message(to_phone: str, text: str) -> str | None:
@@ -163,4 +189,34 @@ async def download_media(media_id: str) -> bytes | None:
             return None
         except Exception as e:
             print(f"[whatsapp_client] Exception downloading media {media_id}: {e}")
+            return None
+
+
+async def send_template_message(to_phone: str, template_name: str, language_code: str = "en_US") -> str | None:
+    """
+    Send a pre-approved template message (required for business-initiated conversations).
+    For testing, we use the default 'hello_world' template.
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {
+                "code": language_code
+            }
+        }
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            res = await client.post(_BASE_URL, json=payload, headers=_HEADERS)
+            res.raise_for_status()
+            data = res.json()
+            return data.get("messages", [{}])[0].get("id")
+        except httpx.HTTPStatusError as e:
+            print(f"[whatsapp_client] Error sending template '{template_name}': {e.response.status_code} - {e.response.text}")
+            return None
+        except Exception as e:
+            print(f"[whatsapp_client] Exception sending template '{template_name}': {e}")
             return None

@@ -6,6 +6,8 @@ export const metadata: Metadata = {
   description: "Multi-Tenant Agentic WhatsApp Orchestrator Admin Dashboard",
 };
 
+import { TenantProvider } from "@/context/TenantContext";
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -26,7 +28,9 @@ export default function RootLayout({
         />
       </head>
       <body className="bg-mesh text-sm antialiased">
-        {children}
+        <TenantProvider>
+          {children}
+        </TenantProvider>
       </body>
     </html>
   );
