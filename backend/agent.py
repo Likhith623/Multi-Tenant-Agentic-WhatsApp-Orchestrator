@@ -277,7 +277,7 @@ async def context_retriever_node(state: AgentState) -> AgentState:
     # - Automotive: the new compact booking flow takes just 2-4 turns
     #   (1 message collects name/vehicle/date/time, 1 message picks services).
     # - Other tenants: 8 msgs gives solid Q&A context without bloating the prompt.
-    raw_messages = await db_client.get_last_n_messages(state["session_id"], n=8)
+    raw_messages = await db_client.get_last_n_messages(state["session_id"], n=10)
 
     # Convert to LangChain message objects (chronological order)
     chat_history: list[BaseMessage] = []
@@ -369,8 +369,11 @@ MESSAGE 1 — When user mentions booking/service, ask ONLY:
 
 Example: "Happy to book your appointment! 🔧 Please share your name and vehicle details (make, model & year)."
 
-MESSAGE 2 — Once you have name & vehicle, present the full services menu with prices from the catalog.
-Ask: "Which service(s) would you like? You can choose multiple — just list them!"
+MESSAGE 2 — Once you have name & vehicle:
+- If you ALREADY identified the required services (e.g. from a previous damage assessment photo), SKIP presenting the menu and move directly to MESSAGE 3.
+- Otherwise, type out the full services menu as a plain TEXT message. List each service and its price from the catalog below, then ask: "Which service(s) would you like? You can choose multiple — just list them!"
+
+⚠️ CRITICAL: Do NOT call attach_media for the services list. Do NOT send any file or document. Type the services menu as plain text in your reply.
 
 MESSAGE 3 — Once user picks their services, ask ONLY:
   • Preferred date
@@ -390,10 +393,35 @@ After calling book_appointment, confirm:
 "✅ Your appointment is confirmed for [date] at [time]. Your invoice has been sent to this WhatsApp. See you soon! 🔧"
 
 IMPORTANT: Strictly follow the 3-message flow. Do NOT ask for everything at once.
+Do NOT call attach_media at any point during the booking flow.
 Do NOT call book_appointment until you have ALL of: name, vehicle, services, date, time.
 """
     else:
         appointment_section = ""
+
+    # Build image handling section (automotive gets damage assessment, others get generic)
+    if is_automotive:
+        image_handling_section = (
+            "IMAGE HANDLING - AUTOMOTIVE DAMAGE ASSESSMENT:\n"
+            "When a customer sends a car photo, you will receive a Vision AI description of it. Use it to:\n\n"
+            "1. IDENTIFY the visible damage clearly and empathetically.\n"
+            "   e.g. 'I can see significant front-end collision damage: crumpled hood, broken headlights.'\n\n"
+            "2. MAP the damage to likely services from your catalog with estimated costs.\n"
+            "   List only the relevant services, one per line: ServiceName - Rs.price\n"
+            "   (If damage needs a service not in the catalog, note: 'pricing on inspection')\n\n"
+            "3. GIVE a total estimated range.\n"
+            "   e.g. 'Estimated repair cost: Rs.8,000 - Rs.12,000 (final quote after inspection)'\n\n"
+            "4. OFFER to book an appointment: 'Would you like to schedule an appointment to bring it in?'\n\n"
+            "5. If customer says YES, start the booking flow (MESSAGE 1: ask name + vehicle). Since you already identified the required services, you will SKIP the services menu in MESSAGE 2.\n\n"
+            "TONE: Be empathetic first, then professional and helpful.\n"
+            "Do NOT say you cannot assess damage or estimate costs. You always can based on the catalog."
+        )
+    else:
+        image_handling_section = (
+            "IMAGE HANDLING:\n"
+            "- If you receive an image, describe what you see in the context of the business.\n"
+            "- Identify if it's a product, damage claim, or relevant inquiry and respond accordingly."
+        )
 
     system_prompt = f"""You are a helpful customer support and sales agent for {state['tenant_name']}.
 
@@ -438,9 +466,8 @@ When you do call close_conversation, write a farewell_message that:
   - Reminds them they can message again anytime.
   - Is warm, brief (2-3 sentences max), and conversational in tone.
 
-IMAGE HANDLING:
-- If you receive an image, describe what you see in the context of the business.
-- Identify if it's a product, damage claim, or relevant inquiry and respond accordingly.
+
+{image_handling_section}
 """
 
     # ── Vision Preprocessing (if image) ────────────────────────────────────────
