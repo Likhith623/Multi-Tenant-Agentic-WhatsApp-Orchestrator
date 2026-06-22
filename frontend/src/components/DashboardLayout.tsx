@@ -14,14 +14,14 @@ function getInitials(name: string): string {
 function BroadcastModal({ onClose }: { onClose: () => void }) {
   const { tenants, activeTenantId } = useTenant();
   const [tenantId, setTenantId] = useState(activeTenantId ?? '');
-  const [templateName, setTemplateName] = useState('hello_world');
+  const [message, setMessage] = useState('');
   const [phonesRaw, setPhonesRaw] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [result, setResult] = useState<{ success: string[]; failed: string[] } | null>(null);
 
   const handleSend = async () => {
     const phones = phonesRaw.split(/[\n,]+/).map(p => p.trim()).filter(Boolean);
-    if (!phones.length || !tenantId || !templateName.trim()) {
+    if (!phones.length || !tenantId || !message.trim()) {
       alert('Please fill in all fields and add at least one phone number.');
       return;
     }
@@ -30,7 +30,7 @@ function BroadcastModal({ onClose }: { onClose: () => void }) {
       const res = await fetch('/backend/api/broadcast', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenant_id: tenantId, template_name: templateName.trim(), phone_numbers: phones }),
+        body: JSON.stringify({ tenant_id: tenantId, message: message.trim(), phone_numbers: phones }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
@@ -49,7 +49,7 @@ function BroadcastModal({ onClose }: { onClose: () => void }) {
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-[18px] font-bold text-slate-800">Broadcast Campaign</h2>
-            <p className="text-[13px] text-slate-500 mt-0.5">Send a WhatsApp template to multiple users at once.</p>
+            <p className="text-[13px] text-slate-500 mt-0.5">Send a custom message to multiple users at once.</p>
           </div>
           <button onClick={onClose} disabled={isSending} className="w-8 h-8 rounded-lg silk-pressed flex items-center justify-center text-slate-400 hover:text-slate-700">
             <span className="material-symbols-outlined text-[18px]">close</span>
@@ -78,9 +78,15 @@ function BroadcastModal({ onClose }: { onClose: () => void }) {
               </select>
             </div>
             <div>
-              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Template Name <span className="text-red-400">*</span></label>
-              <input type="text" value={templateName} onChange={e => setTemplateName(e.target.value)} placeholder="e.g. hello_world" className="w-full silk-pressed rounded-xl px-4 py-2.5 text-[14px] text-slate-700 placeholder:text-slate-300 focus:outline-none border border-white/60" />
-              <p className="text-[11px] text-slate-400 mt-1">Must be an approved Meta template name.</p>
+              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Message <span className="text-red-400">*</span></label>
+              <textarea
+                rows={4}
+                value={message}
+                onChange={e => setMessage(e.target.value)}
+                placeholder="Type your broadcast message here…"
+                className="w-full silk-pressed rounded-xl px-4 py-2.5 text-[14px] text-slate-700 placeholder:text-slate-300 focus:outline-none border border-white/60 resize-none"
+              />
+              <p className="text-[11px] text-slate-400 mt-1">Your message will be delivered to all recipients.</p>
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Phone Numbers <span className="text-red-400">*</span></label>
@@ -89,7 +95,7 @@ function BroadcastModal({ onClose }: { onClose: () => void }) {
             </div>
             <div className="flex gap-3 pt-1">
               <button onClick={onClose} disabled={isSending} className="flex-1 py-2.5 rounded-xl silk-extruded text-slate-600 font-semibold text-[14px] hover:text-slate-800 transition-colors disabled:opacity-50">Cancel</button>
-              <button onClick={handleSend} disabled={isSending || !tenantId || !templateName.trim() || !phonesRaw.trim()} className="flex-1 py-2.5 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white font-bold text-[14px] shadow-lg shadow-indigo-500/20 hover:from-indigo-600 hover:to-violet-700 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
+              <button onClick={handleSend} disabled={isSending || !tenantId || !message.trim() || !phonesRaw.trim()} className="flex-1 py-2.5 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white font-bold text-[14px] shadow-lg shadow-indigo-500/20 hover:from-indigo-600 hover:to-violet-700 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
                 {isSending ? (<><svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>Sending…</>) : (<><span className="material-symbols-outlined text-[18px]">campaign</span>Send Broadcast</>)}
               </button>
             </div>
@@ -131,9 +137,14 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   const links = [
     { href: '/', icon: 'forum', label: 'Chat Monitor' },
     { href: '/media', icon: 'folder_shared', label: 'Media Library' },
+    { href: '/appointments', icon: 'calendar_month', label: 'Appointments' },
     { href: '/tenants', icon: 'corporate_fare', label: 'Tenants' },
     { href: '/settings', icon: 'settings', label: 'Settings' },
-  ];
+  ].filter(link => {
+    // Hide Appointments for Luxury Furniture Store
+    if (link.label === 'Appointments' && activeTenant?.name?.includes('Furniture')) return false;
+    return true;
+  });
 
   return (
     <div className="flex h-screen overflow-hidden text-slate-800">

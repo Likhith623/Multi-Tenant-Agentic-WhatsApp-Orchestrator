@@ -266,15 +266,22 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
 class BroadcastRequest(BaseModel):
     tenant_id: str
-    template_name: str
+    message: str
     phone_numbers: list[str]
 
 
 @app.post("/api/broadcast")
 async def trigger_broadcast(req: BroadcastRequest):
     """
-    Triggers a WhatsApp template broadcast to a list of phone numbers.
-    Used by the frontend Broadcast Campaign Drawer.
+    Broadcasts a custom message to a list of phone numbers.
+
+    Uses a hybrid strategy:
+    1. First attempts a free-form text message (works if the 24-hour window is open).
+    2. Falls back to a Meta-approved template with a single body variable {{1}} if
+       the window is closed.
+
+    Prerequisites: Create a template called `custom_broadcast` (or whatever
+    BROADCAST_TEMPLATE_NAME is set to) in Meta Business Manager with body = {{1}}.
     """
     import db_client
     import whatsapp_client
@@ -283,26 +290,43 @@ async def trigger_broadcast(req: BroadcastRequest):
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    # Template name configured in .env — must be an approved Meta template with body {{1}}
+    template_name = os.environ.get("BROADCAST_TEMPLATE_NAME", "custom_broadcast")
+
     results = {"success": [], "failed": []}
 
     for phone in req.phone_numbers:
-        msg_id = await whatsapp_client.send_template_message(phone, req.template_name)
-        if msg_id:
-            # We log this in the database to maintain history
-            # Generate a pseudo session ID for the broadcast thread
-            session_id = f"broadcast_{req.tenant_id}_{phone}"
-            await db_client.insert_message(
-                message_id=msg_id,
-                session_id=session_id,
-                direction="outbound",
-                content_type="text",
-                text_content=f"[Broadcast Template Sent: {req.template_name}]",
-            )
-            results["success"].append(phone)
-        else:
+        try:
+            # 1. Try sending a normal free-form text message first.
+            # This succeeds silently if the 24-hour customer service window is open!
+            msg_id = await whatsapp_client.send_text_message(to_phone=phone, text=req.message)
+
+            # 2. If it fails (e.g. window is closed), fallback to the approved template.
+            if not msg_id:
+                msg_id = await whatsapp_client.send_template_with_body_variable(
+                    to_phone=phone,
+                    template_name=template_name,
+                    body_text=req.message,
+                )
+
+            if msg_id:
+                session_id = f"broadcast_{req.tenant_id}_{phone}"
+                await db_client.insert_message(
+                    message_id=msg_id,
+                    session_id=session_id,
+                    direction="outbound",
+                    content_type="text",
+                    text_content=req.message,
+                )
+                results["success"].append(phone)
+            else:
+                results["failed"].append(phone)
+        except Exception as e:
+            print(f"[broadcast] Error sending to {phone}: {e}")
             results["failed"].append(phone)
 
     return {"status": "completed", "results": results}
+
 
 
 # ---------------------------------------------------------------------------
@@ -366,3 +390,130 @@ async def send_human_message(req: ChatRequest):
         return {"status": "success", "message_id": msg_id}
     else:
         raise HTTPException(status_code=500, detail="Failed to send message via Meta API")
+
+
+# ---------------------------------------------------------------------------
+# Appointments API
+# ---------------------------------------------------------------------------
+
+from supabase import create_client as _create_sb_sync
+
+def _sync_supabase():
+    return _create_sb_sync(
+        os.environ["SUPABASE_URL"],
+        os.environ["SUPABASE_SECRET_KEY"],
+    )
+
+
+@app.get("/api/appointments")
+async def list_appointments(tenant_id: str, status: str | None = None):
+    """
+    Returns all appointments for a given tenant.
+    Optional `status` query param filters by: SCHEDULED | INVOICED | CANCELLED
+    """
+    sb = _sync_supabase()
+    query = sb.table("appointments").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True)
+    if status:
+        query = query.eq("status", status)
+    result = query.execute()
+    return {"appointments": result.data}
+
+
+class CancelAppointmentRequest(BaseModel):
+    reason: str = "Cancelled by staff"
+
+
+@app.post("/api/appointments/{appointment_id}/cancel")
+async def cancel_appointment(appointment_id: str, req: CancelAppointmentRequest):
+    """Cancel an appointment and notify the customer via WhatsApp."""
+    sb = _sync_supabase()
+
+    # Fetch appointment to get customer phone
+    appt_result = sb.table("appointments").select("*").eq("id", appointment_id).single().execute()
+    if not appt_result.data:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    appt = appt_result.data
+
+    # Mark as cancelled
+    sb.table("appointments").update({"status": "CANCELLED"}).eq("id", appointment_id).execute()
+
+    # Notify the customer on WhatsApp
+    msg = (
+        f"Hi {appt.get('customer_name', 'there')}, your appointment scheduled for "
+        f"{appt.get('appointment_date', '')} at {appt.get('appointment_time', '')} "
+        f"has been cancelled. Reason: {req.reason}. "
+        f"Please contact us to reschedule. We apologise for the inconvenience. 🙏"
+    )
+    await whatsapp_client.send_text_message(appt["customer_phone"], msg)
+
+    return {"status": "cancelled", "appointment_id": appointment_id}
+
+
+class RegenerateInvoiceRequest(BaseModel):
+    pass
+
+
+@app.post("/api/appointments/{appointment_id}/generate-invoice")
+async def regenerate_invoice(appointment_id: str):
+    """
+    Manually generate (or re-generate) a PDF invoice for an appointment.
+    Useful for re-sending or manual triggering from the dashboard.
+    """
+    import invoice_service
+
+    api_key = os.environ.get("INVOICE_GENERATOR_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="INVOICE_GENERATOR_API_KEY not configured")
+
+    sb = _sync_supabase()
+    appt_result = sb.table("appointments").select("*").eq("id", appointment_id).single().execute()
+    if not appt_result.data:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    appt = appt_result.data
+    services = appt.get("services", [])
+
+    if not services:
+        raise HTTPException(status_code=400, detail="No services on this appointment")
+
+    import time
+    invoice_number = str(int(time.time()))[-8:]
+
+    pdf_bytes = await invoice_service.generate_invoice_pdf(
+        api_key=api_key,
+        from_address="Automotive Care\nKrid Services Pvt. Ltd.",
+        to_name=appt.get("customer_name", "Customer"),
+        customer_phone=appt["customer_phone"],
+        services=services,
+        appointment_date=appt.get("appointment_date", ""),
+        invoice_number=invoice_number,
+        currency="INR",
+    )
+
+    if not pdf_bytes:
+        raise HTTPException(status_code=500, detail="Invoice generation failed")
+
+    invoice_url = await invoice_service.upload_pdf_to_storage(
+        pdf_bytes=pdf_bytes,
+        tenant_id=appt["tenant_id"],
+        invoice_number=invoice_number,
+    )
+
+    if not invoice_url:
+        raise HTTPException(status_code=500, detail="Failed to upload invoice to storage")
+
+    # Update appointment
+    sb.table("appointments").update(
+        {"status": "INVOICED", "invoice_url": invoice_url}
+    ).eq("id", appointment_id).execute()
+
+    # Send to customer on WhatsApp
+    out_id = await whatsapp_client.send_document_message(
+        appt["customer_phone"],
+        doc_url=invoice_url,
+        filename=f"Invoice_{invoice_number}.pdf",
+        caption="📄 Here is your updated service invoice.",
+    )
+
+    return {"status": "invoice_sent", "invoice_url": invoice_url, "message_id": out_id}

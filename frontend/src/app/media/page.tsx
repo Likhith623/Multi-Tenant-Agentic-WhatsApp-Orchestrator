@@ -153,7 +153,15 @@ export default function MediaLibraryPage() {
   if (Array.isArray(activeTenant.media_library)) {
     mediaList = activeTenant.media_library;
   } else if (typeof activeTenant.media_library === 'object' && activeTenant.media_library !== null) {
-    mediaList = Object.values(activeTenant.media_library);
+    mediaList = Object.entries(activeTenant.media_library).map(([key, value]) => {
+      if (typeof value === 'object' && value !== null) return value as MediaItem;
+      return {
+        id: key,
+        name: key,
+        url: value as string,
+        type: typeof value === 'string' && value.toLowerCase().endsWith('.pdf') ? 'document' : 'image'
+      };
+    });
   }
 
   // Step 1: File picker opens → store file and show modal
@@ -325,14 +333,14 @@ export default function MediaLibraryPage() {
               </div>
             )}
 
-            {mediaList.filter(m => m.name.toLowerCase().includes(mediaSearch.toLowerCase().trim())).length === 0 && mediaList.length > 0 && (
+            {mediaList.filter(m => m?.name?.toLowerCase().includes(mediaSearch.toLowerCase().trim())).length === 0 && mediaList.length > 0 && (
               <div className="col-span-full py-12 text-center text-slate-400">
                 <span className="material-symbols-outlined text-[40px] block mb-2">search_off</span>
                 <p>No media matching &ldquo;{mediaSearch}&rdquo;</p>
               </div>
             )}
 
-            {mediaList.filter(m => m.name.toLowerCase().includes(mediaSearch.toLowerCase().trim())).map(media => {
+            {mediaList.filter(m => m?.name?.toLowerCase().includes(mediaSearch.toLowerCase().trim())).map(media => {
               const isDeleting = deletingId === media.id;
               return (
                 <div

@@ -207,3 +207,49 @@ async def send_template_message(to_phone: str, template_name: str, language_code
         except Exception as e:
             print(f"[whatsapp_client] Exception sending template '{template_name}': {e}")
             return None
+
+
+async def send_template_with_body_variable(
+    to_phone: str,
+    template_name: str,
+    body_text: str,
+    language_code: str = "en",
+) -> str | None:
+    """
+    Send an approved Meta template that has a single body variable {{1}}.
+    The `body_text` value is passed as the {{1}} parameter.
+
+    Usage: create a template called `custom_broadcast` with body = `{{1}}`
+    in Meta Business Manager, then call this function with the actual message.
+    This avoids showing any boilerplate (e.g. hello_world) to the recipient.
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language_code},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": body_text}
+                    ],
+                }
+            ],
+        },
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            res = await client.post(_BASE_URL, json=payload, headers=_HEADERS)
+            res.raise_for_status()
+            data = res.json()
+            print(f"[whatsapp_client] Template '{template_name}' sent to {to_phone}")
+            return data.get("messages", [{}])[0].get("id")
+        except httpx.HTTPStatusError as e:
+            print(f"[whatsapp_client] Error sending template '{template_name}': {e.response.status_code} - {e.response.text}")
+            return None
+        except Exception as e:
+            print(f"[whatsapp_client] Exception sending template '{template_name}': {e}")
+            return None

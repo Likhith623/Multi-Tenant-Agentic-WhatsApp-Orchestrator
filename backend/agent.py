@@ -46,6 +46,7 @@ from langgraph.graph import StateGraph, END
 
 import db_client
 import whatsapp_client
+import invoice_service
 
 load_dotenv()
 
@@ -126,7 +127,57 @@ def close_conversation(farewell_message: str) -> str:
     return farewell_message
 
 
-_tools = [attach_media, escalate_to_human, close_conversation]
+@tool
+def book_appointment(
+    customer_name: str,
+    vehicle_info: str,
+    services: str,
+    appointment_date: str,
+    appointment_time: str,
+    notes: str = "",
+) -> str:
+    """
+    Book a service appointment for the customer.
+
+    Call this ONLY once you have collected ALL of the following from the
+    customer through conversation:
+      - customer_name: their full name
+      - vehicle_info: make, model, and year of their vehicle (e.g. "Honda City 2020")
+      - services: comma-separated list of services they need
+                  (e.g. "Oil Change, Brake Pad Replacement").
+                  Each service MUST include the price from the pricing catalog
+                  in this format: "ServiceName:price" (e.g. "Oil Change:2500")
+      - appointment_date: the date they prefer (e.g. "June 25, 2025")
+      - appointment_time: the time they prefer (e.g. "10:00 AM")
+      - notes: any extra notes (optional)
+
+    Returns a booking reference string once saved successfully.
+    After calling this, ALWAYS call generate_and_send_invoice next.
+    """
+    return f"BOOK:{customer_name}|{vehicle_info}|{services}|{appointment_date}|{appointment_time}|{notes}"
+
+
+@tool
+def generate_and_send_invoice(
+    booking_ref: str,
+    customer_name: str,
+) -> str:
+    """
+    Generate a professional PDF invoice and send it to the customer on WhatsApp.
+
+    Call this IMMEDIATELY after book_appointment succeeds.
+    Pass the exact booking_ref string returned by book_appointment, and
+    the customer's name for personalisation.
+
+    This will:
+      1. Generate a PDF invoice via invoice-generator.com
+      2. Upload it to cloud storage
+      3. Send it as a WhatsApp document to the customer
+    """
+    return f"INVOICE:{booking_ref}|{customer_name}"
+
+
+_tools = [attach_media, escalate_to_human, close_conversation, book_appointment, generate_and_send_invoice]
 _llm_with_tools = _llm.bind_tools(_tools)
 
 
@@ -222,8 +273,10 @@ async def context_retriever_node(state: AgentState) -> AgentState:
     if tenant is None:
         raise ValueError(f"[agent:context_retriever] Tenant {state['tenant_id']} not found.")
 
-    # Fetch last 5 messages using the compound index (fast retrieval)
-    raw_messages = await db_client.get_last_n_messages(state["session_id"], n=5)
+    # Fetch last 15 messages — booking conversations span many turns (name, vehicle,
+    # services, date, time, notes = 6+ back-and-forth exchanges), so we need more
+    # history than the default 5 to keep all details in the LLM's context window.
+    raw_messages = await db_client.get_last_n_messages(state["session_id"], n=15)
 
     # Convert to LangChain message objects (chronological order)
     chat_history: list[BaseMessage] = []
@@ -299,6 +352,41 @@ async def llm_reasoning_node(state: AgentState) -> AgentState:
     else:
         media_section = "MEDIA ASSETS: No media assets have been uploaded for this tenant yet."
 
+    # Build automotive appointment section if this is an auto-service tenant
+    tenant_name_lower = state['tenant_name'].lower()
+    is_automotive = any(kw in tenant_name_lower for kw in ["auto", "car", "motor", "vehicle", "repair", "garage", "service"])
+
+    if is_automotive:
+        appointment_section = """
+APPOINTMENT BOOKING (Automotive Only):
+You can book service appointments for customers using the book_appointment tool.
+Follow this conversational flow — ask ONE question at a time:
+  1. Ask for their full name.
+  2. Ask for their vehicle make, model, and year (e.g. "Honda City 2020").
+  3. Ask which service(s) they need — suggest options from the pricing catalog above.
+  4. Ask for their preferred date.
+  5. Ask for their preferred time.
+  6. Ask if they have any special notes (say it's optional).
+
+Once you have ALL details, call book_appointment with the services argument.
+
+CRITICAL SERVICES RULE:
+- Include EVERY service the customer mentioned — do NOT omit any.
+- Format: comma-separated "ServiceName:price" pairs using prices from the catalog.
+- Example: "Synthetic Engine Oil & Filter Change:2500,Brake Pad Replacement:1800,Wheel Alignment:800"
+- If the customer asks for 6 services, ALL 6 must appear in the services string.
+- If a service isn't in the catalog, still include it with price 0: "Custom Service:0"
+
+After calling book_appointment, confirm to the customer:
+"✅ Your appointment is confirmed for [date] at [time]. I've sent your invoice
+to this WhatsApp — please check your messages. See you soon! 🔧"
+
+IMPORTANT: Do NOT call book_appointment until you have ALL 5 required pieces of
+information (name, vehicle, services, date, time). Keep asking until you have them all.
+"""
+    else:
+        appointment_section = ""
+
     system_prompt = f"""You are a helpful customer support and sales agent for {state['tenant_name']}.
 
 {state['tenant_prompt']}
@@ -309,7 +397,7 @@ IMPORTANT FORMATTING RULES:
 - NEVER say you cannot send files or media. You always have the attach_media tool available.
 
 {media_section}
-
+{appointment_section}
 SENTIMENT ANALYSIS & ESCALATION RULES:
 - Assess the user's emotional state in every message.
 - If the user expresses CLEAR frustration, anger, repeated complaints, or
@@ -455,6 +543,125 @@ async def dispatcher_node(state: AgentState) -> AgentState:
     try:
         if ai_message.tool_calls:
             for tool_call in ai_message.tool_calls:
+
+                # -------------------------------------------------------------
+                # CASE 0a: Book Appointment — save to DB
+                # -------------------------------------------------------------
+                if tool_call["name"] == "book_appointment":
+                    args = tool_call["args"]
+                    customer_name = args.get("customer_name", "Customer")
+                    vehicle_info = args.get("vehicle_info", "")
+                    raw_services = args.get("services", "")
+                    appointment_date = args.get("appointment_date", "")
+                    appointment_time = args.get("appointment_time", "")
+                    notes = args.get("notes", "")
+
+                    # Parse "Name:price,Name:price" into list of dicts
+                    parsed_services = []
+                    for svc in raw_services.split(","):
+                        svc = svc.strip()
+                        if ":" in svc:
+                            parts = svc.rsplit(":", 1)
+                            svc_name = parts[0].strip()
+                            try:
+                                price = float(parts[1].strip())
+                            except ValueError:
+                                price = 0.0
+                            parsed_services.append({"name": svc_name, "quantity": 1, "unit_cost": price})
+                        elif svc:
+                            parsed_services.append({"name": svc, "quantity": 1, "unit_cost": 0})
+
+                    appt_id = await invoice_service.save_appointment(
+                        tenant_id=state["tenant_id"],
+                        session_id=session_id,
+                        customer_phone=from_phone,
+                        customer_name=customer_name,
+                        vehicle_info=vehicle_info,
+                        services=parsed_services,
+                        appointment_date=appointment_date,
+                        appointment_time=appointment_time,
+                        notes=notes,
+                    )
+                    print(f"[agent:dispatcher] 📅 Appointment booked: {appt_id}")
+
+                    # ── Auto-generate & send invoice immediately ──────────────
+                    # Do NOT wait for a separate LLM tool call — trigger inline
+                    # so the invoice is always sent right after booking succeeds.
+                    import time as _time
+                    api_key = os.environ.get("INVOICE_GENERATOR_API_KEY", "")
+                    if api_key and parsed_services:
+                        invoice_number = str(int(_time.time()))[-8:]
+                        print(f"[agent:dispatcher] 🧾 Generating invoice {invoice_number} for {customer_name}...")
+
+                        pdf_bytes = await invoice_service.generate_invoice_pdf(
+                            api_key=api_key,
+                            from_address="Automotive Care\nKrid Services Pvt. Ltd.",
+                            to_name=customer_name,
+                            customer_phone=from_phone,
+                            services=parsed_services,
+                            appointment_date=appointment_date,
+                            invoice_number=invoice_number,
+                            currency="INR",
+                        )
+
+                        if pdf_bytes:
+                            invoice_url = await invoice_service.upload_pdf_to_storage(
+                                pdf_bytes=pdf_bytes,
+                                tenant_id=state["tenant_id"],
+                                invoice_number=invoice_number,
+                            )
+                            if invoice_url and appt_id:
+                                await invoice_service.mark_appointment_invoiced(appt_id, invoice_url)
+                            if invoice_url:
+                                out_id = await whatsapp_client.send_document_message(
+                                    from_phone,
+                                    doc_url=invoice_url,
+                                    filename=f"Invoice_{invoice_number}.pdf",
+                                    caption="Here is your service invoice. Please review the details.",
+                                )
+                                if out_id:
+                                    await db_client.insert_message(
+                                        message_id=out_id,
+                                        session_id=session_id,
+                                        direction="outbound",
+                                        content_type="document",
+                                        text_content="[Invoice PDF sent]",
+                                        media_url=invoice_url,
+                                    )
+                                print(f"[agent:dispatcher] 📄 Invoice sent to {from_phone} → {invoice_url}")
+
+                                # Send confirmation text
+                                confirmation_text = f"✅ Your appointment is confirmed for {appointment_date} at {appointment_time}. I've sent your invoice. See you soon! 🔧"
+                                msg_id = await whatsapp_client.send_text_message(from_phone, confirmation_text)
+                                if msg_id:
+                                    await db_client.insert_message(
+                                        message_id=msg_id,
+                                        session_id=session_id,
+                                        direction="outbound",
+                                        content_type="text",
+                                        text_content=confirmation_text
+                                    )
+
+                                # Mark session as done
+                                await db_client.resolve_session(session_id)
+                                print(f"[agent:dispatcher] Session {session_id} resolved after booking.")
+                        else:
+                            print("[agent:dispatcher] ⚠️ Invoice PDF generation failed")
+                    else:
+                        if not api_key:
+                            print("[agent:dispatcher] ⚠️ INVOICE_GENERATOR_API_KEY not set — skipping invoice")
+                        if not parsed_services:
+                            print("[agent:dispatcher] ⚠️ No services to invoice")
+                    continue
+
+                # -------------------------------------------------------------
+                # CASE 0b: generate_and_send_invoice — handled inline above,
+                # but keep this case as a fallback if LLM calls it explicitly
+                # -------------------------------------------------------------
+                elif tool_call["name"] == "generate_and_send_invoice":
+                    # Silently skip — invoice is auto-sent by book_appointment handler
+                    print("[agent:dispatcher] ℹ️ generate_and_send_invoice skipped (already handled inline)")
+                    continue
 
                 # -------------------------------------------------------------
                 # CASE 1: Escalation — LLM detected user frustration
