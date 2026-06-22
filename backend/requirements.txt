@@ -9,3 +9,4 @@ langchain-mistralai
 langchain-google-genai
 google-generativeai
 httpx
+fpdf2

@@ -273,10 +273,11 @@ async def context_retriever_node(state: AgentState) -> AgentState:
     if tenant is None:
         raise ValueError(f"[agent:context_retriever] Tenant {state['tenant_id']} not found.")
 
-    # Fetch last 15 messages — booking conversations span many turns (name, vehicle,
-    # services, date, time, notes = 6+ back-and-forth exchanges), so we need more
-    # history than the default 5 to keep all details in the LLM's context window.
-    raw_messages = await db_client.get_last_n_messages(state["session_id"], n=15)
+    # 8 messages is sufficient for all tenants:
+    # - Automotive: the new compact booking flow takes just 2-4 turns
+    #   (1 message collects name/vehicle/date/time, 1 message picks services).
+    # - Other tenants: 8 msgs gives solid Q&A context without bloating the prompt.
+    raw_messages = await db_client.get_last_n_messages(state["session_id"], n=8)
 
     # Convert to LangChain message objects (chronological order)
     chat_history: list[BaseMessage] = []
@@ -342,12 +343,11 @@ async def llm_reasoning_node(state: AgentState) -> AgentState:
         media_section = (
             "AVAILABLE MEDIA ASSETS:\n"
             "The following files are available to send to the user. "
-            "When the user's request matches or is clearly related to one of these assets, "
-            "you MUST call the attach_media tool with the exact keyword shown.\n"
+            "If the user asks to see a product, image, or document that is in this list, "
+            "you MUST invoke the `attach_media` tool immediately. Do not just describe it.\n"
             + media_lines
-            + "\n\nMEDIA RULE: If the user's request can be fulfilled by any asset above, "
-            "call attach_media with the matching keyword. "
-            "Never apologise or say you lack the capability — use the tool."
+            + "\n\nCRITICAL MEDIA RULE: If you are sending a user a file/image, you MUST use the `attach_media` tool. "
+            "Never apologise or say you lack the capability. Call the tool with the matching keyword."
         )
     else:
         media_section = "MEDIA ASSETS: No media assets have been uploaded for this tenant yet."
@@ -359,30 +359,38 @@ async def llm_reasoning_node(state: AgentState) -> AgentState:
     if is_automotive:
         appointment_section = """
 APPOINTMENT BOOKING (Automotive Only):
-You can book service appointments for customers using the book_appointment tool.
-Follow this conversational flow — ask ONE question at a time:
-  1. Ask for their full name.
-  2. Ask for their vehicle make, model, and year (e.g. "Honda City 2020").
-  3. Ask which service(s) they need — suggest options from the pricing catalog above.
-  4. Ask for their preferred date.
-  5. Ask for their preferred time.
-  6. Ask if they have any special notes (say it's optional).
+You can book service appointments using the book_appointment tool.
 
-Once you have ALL details, call book_appointment with the services argument.
+FOLLOW THIS EXACT 3-MESSAGE FLOW:
+
+MESSAGE 1 — When user mentions booking/service, ask ONLY:
+  • Their full name
+  • Vehicle make, model & year (e.g. Honda City 2026)
+
+Example: "Happy to book your appointment! 🔧 Please share your name and vehicle details (make, model & year)."
+
+MESSAGE 2 — Once you have name & vehicle, present the full services menu with prices from the catalog.
+Ask: "Which service(s) would you like? You can choose multiple — just list them!"
+
+MESSAGE 3 — Once user picks their services, ask ONLY:
+  • Preferred date
+  • Preferred time
+
+Example: "Perfect! What date and time works best for you? 🗓️"
+
+Once the user replies with date & time → immediately call book_appointment.
 
 CRITICAL SERVICES RULE:
-- Include EVERY service the customer mentioned — do NOT omit any.
-- Format: comma-separated "ServiceName:price" pairs using prices from the catalog.
-- Example: "Synthetic Engine Oil & Filter Change:2500,Brake Pad Replacement:1800,Wheel Alignment:800"
-- If the customer asks for 6 services, ALL 6 must appear in the services string.
-- If a service isn't in the catalog, still include it with price 0: "Custom Service:0"
+- Include EVERY service the customer selected.
+- Format: comma-separated "ServiceName:price" pairs.
+- Example: "Synthetic Engine Oil & Filter Change:2500,Brake Pad Replacement:1800"
+- If a service isn't in the catalog, include it with price 0: "Custom Service:0"
 
-After calling book_appointment, confirm to the customer:
-"✅ Your appointment is confirmed for [date] at [time]. I've sent your invoice
-to this WhatsApp — please check your messages. See you soon! 🔧"
+After calling book_appointment, confirm:
+"✅ Your appointment is confirmed for [date] at [time]. Your invoice has been sent to this WhatsApp. See you soon! 🔧"
 
-IMPORTANT: Do NOT call book_appointment until you have ALL 5 required pieces of
-information (name, vehicle, services, date, time). Keep asking until you have them all.
+IMPORTANT: Strictly follow the 3-message flow. Do NOT ask for everything at once.
+Do NOT call book_appointment until you have ALL of: name, vehicle, services, date, time.
 """
     else:
         appointment_section = ""
@@ -394,7 +402,7 @@ information (name, vehicle, services, date, time). Keep asking until you have th
 IMPORTANT FORMATTING RULES:
 - Never use markdown links like [text](url). WhatsApp does not render them.
 - Keep responses concise and friendly for a mobile messaging format.
-- NEVER say you cannot send files or media. You always have the attach_media tool available.
+- If a user asks for an image/file and it's in the assets list, you MUST call `attach_media` rather than just saying "Here it is".
 
 {media_section}
 {appointment_section}
@@ -584,17 +592,14 @@ async def dispatcher_node(state: AgentState) -> AgentState:
                     )
                     print(f"[agent:dispatcher] 📅 Appointment booked: {appt_id}")
 
-                    # ── Auto-generate & send invoice immediately ──────────────
-                    # Do NOT wait for a separate LLM tool call — trigger inline
-                    # so the invoice is always sent right after booking succeeds.
+                    # ── Auto-generate & send invoice immediately (local fpdf2, no API key needed) ──
                     import time as _time
-                    api_key = os.environ.get("INVOICE_GENERATOR_API_KEY", "")
-                    if api_key and parsed_services:
+                    if parsed_services:
                         invoice_number = str(int(_time.time()))[-8:]
-                        print(f"[agent:dispatcher] 🧾 Generating invoice {invoice_number} for {customer_name}...")
+                        print(f"[agent:dispatcher] 🧭 Generating invoice {invoice_number} for {customer_name}...")
 
                         pdf_bytes = await invoice_service.generate_invoice_pdf(
-                            api_key=api_key,
+                            api_key="",  # unused — local fpdf2 generator
                             from_address="Automotive Care\nKrid Services Pvt. Ltd.",
                             to_name=customer_name,
                             customer_phone=from_phone,
@@ -648,10 +653,7 @@ async def dispatcher_node(state: AgentState) -> AgentState:
                         else:
                             print("[agent:dispatcher] ⚠️ Invoice PDF generation failed")
                     else:
-                        if not api_key:
-                            print("[agent:dispatcher] ⚠️ INVOICE_GENERATOR_API_KEY not set — skipping invoice")
-                        if not parsed_services:
-                            print("[agent:dispatcher] ⚠️ No services to invoice")
+                        print("[agent:dispatcher] ⚠️ No services to invoice")
                     continue
 
                 # -------------------------------------------------------------

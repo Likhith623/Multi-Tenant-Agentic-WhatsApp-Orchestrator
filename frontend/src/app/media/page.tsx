@@ -164,6 +164,35 @@ export default function MediaLibraryPage() {
     });
   }
 
+  /**
+   * Convert any image File to a JPEG Blob via canvas.
+   * WhatsApp only accepts JPG/PNG/WebP — this ensures we always store a clean JPEG
+   * regardless of what the user uploaded (GIF, HEIC re-saved as JPG, BMP, etc.)
+   */
+  const convertToJpeg = (file: File): Promise<Blob> =>
+    new Promise((resolve, reject) => {
+      const img = new Image();
+      const objectUrl = URL.createObjectURL(file);
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { reject(new Error('Canvas not supported')); return; }
+        // Fill white background first (handles transparent PNGs)
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob(blob => {
+          URL.revokeObjectURL(objectUrl);
+          if (blob) resolve(blob);
+          else reject(new Error('Canvas toBlob failed'));
+        }, 'image/jpeg', 0.92);
+      };
+      img.onerror = () => { URL.revokeObjectURL(objectUrl); reject(new Error('Image load failed')); };
+      img.src = objectUrl;
+    });
+
   // Step 1: File picker opens → store file and show modal
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -180,8 +209,25 @@ export default function MediaLibraryPage() {
     const mediaType: 'image' | 'document' = isImage ? 'image' : 'document';
 
     const timestamp = Date.now();
-    const safeName = pendingFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const storagePath = `${activeTenant.id}/${timestamp}_${safeName}`;
+    let fileToUpload: File | Blob = pendingFile;
+    let storagePath: string;
+
+    if (isImage) {
+      // Always convert images to JPEG so WhatsApp can always display them
+      try {
+        const jpegBlob = await convertToJpeg(pendingFile);
+        fileToUpload = jpegBlob;
+        const baseName = pendingFile.name.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+        storagePath = `${activeTenant.id}/${timestamp}_${baseName}.jpg`;
+      } catch (e) {
+        console.warn('[media] JPEG conversion failed, uploading original:', e);
+        const safeName = pendingFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+        storagePath = `${activeTenant.id}/${timestamp}_${safeName}`;
+      }
+    } else {
+      const safeName = pendingFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      storagePath = `${activeTenant.id}/${timestamp}_${safeName}`;
+    }
 
     setIsUploading(true);
 
@@ -189,7 +235,7 @@ export default function MediaLibraryPage() {
       // 1. Upload physical file to Supabase Storage
       const { error: uploadError } = await supabase.storage
         .from(BUCKET)
-        .upload(storagePath, pendingFile, { cacheControl: '3600', upsert: false });
+        .upload(storagePath, fileToUpload, { cacheControl: '3600', upsert: false, contentType: isImage ? 'image/jpeg' : pendingFile.type });
 
       if (uploadError) {
         console.error('[media] Upload error:', uploadError);
@@ -305,13 +351,13 @@ export default function MediaLibraryPage() {
                   </button>
                 )}
               </div>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="px-5 py-2.5 bg-gradient-to-br from-indigo-500 to-violet-600 hover:from-indigo-600 hover:to-violet-700 text-white rounded-xl font-bold shadow-lg shadow-indigo-500/20 transition-all flex items-center gap-2"
-            >
-              <span className="material-symbols-outlined text-[20px]">cloud_upload</span>
-              Upload Media
-            </button>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="px-5 py-2.5 bg-gradient-to-br from-indigo-500 to-violet-600 hover:from-indigo-600 hover:to-violet-700 text-white rounded-xl font-bold shadow-lg shadow-indigo-500/20 transition-all flex items-center gap-2"
+              >
+                <span className="material-symbols-outlined text-[20px]">cloud_upload</span>
+                Upload Media
+              </button>
             </div>
           </div>
 
