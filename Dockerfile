@@ -89,6 +89,7 @@ COPY backend/main.py \
      backend/agent.py \
      backend/db_client.py \
      backend/whatsapp_client.py \
+     backend/invoice_service.py \
      ./
 
 # ── Next.js standalone build ──────────────────────────────────────────────────
