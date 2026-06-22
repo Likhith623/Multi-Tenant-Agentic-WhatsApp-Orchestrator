@@ -138,8 +138,16 @@ export default function Dashboard() {
   const [sessions, setSessions]             = useState<Session[]>([]);
   const [activeSession, setActiveSession]   = useState<Session | null>(null);
   const [messages, setMessages]             = useState<Message[]>([]);
+  const [isResolving, setIsResolving]       = useState(false);
+
+  const [chatInput, setChatInput] = useState('');
+  const [isSending, setIsSending] = useState(false);
+  const [isTakingOver, setIsTakingOver] = useState(false);
+  const [sessionSearch, setSessionSearch] = useState('');
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatCanvasRef = useRef<HTMLDivElement>(null);
+  const typingDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Auto-scroll to latest message
   useEffect(() => {
@@ -226,20 +234,128 @@ export default function Dashboard() {
   // ── Real-time: new messages ──────────────────────────────────────────────────
   useEffect(() => {
     if (!activeSession) return;
+    const sessionId = activeSession.id;
+    const sessionStatus = activeSession.status;
+    const customerPhone = activeSession.customer_phone;
+
     const channel = supabase
-      .channel(`messages-session-${activeSession.id}`)
+      .channel(`messages-session-${sessionId}`)
       .on('postgres_changes', {
         event: 'INSERT',
         schema: 'public',
         table: 'messages',
-        filter: `session_id=eq.${activeSession.id}`,
+        filter: `session_id=eq.${sessionId}`,
       }, (payload) => {
-        setMessages(prev => [...prev, payload.new as Message]);
+        const newMsg = payload.new as Message;
+        setMessages(prev => [...prev, newMsg]);
+
+        // Auto blue-tick: when a new customer message arrives while the
+        // human agent is already viewing this NEEDS_HUMAN session.
+        if (newMsg.direction === 'inbound' && sessionStatus === 'NEEDS_HUMAN') {
+          fetch(`/backend/api/sessions/${sessionId}/read`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ customer_phone: customerPhone }),
+          }).catch(console.error);
+        }
       })
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
-  }, [activeSession?.id]);
+  }, [activeSession?.id, activeSession?.status, activeSession?.customer_phone]);
+
+
+  // ── Resolve Session ──────────────────────────────────────────────────────────
+  const handleResolveSession = async () => {
+    if (!activeSession || activeSession.status === 'RESOLVED') return;
+    if (!confirm(`Mark conversation with ${activeSession.customer_phone} as Resolved?\n\nThe bot will automatically start a fresh session the next time this customer messages.`)) return;
+
+    setIsResolving(true);
+    const { error } = await supabase
+      .from('sessions')
+      .update({ status: 'RESOLVED', updated_at: new Date().toISOString() })
+      .eq('id', activeSession.id);
+
+    setIsResolving(false);
+    if (error) {
+      alert('Failed to resolve session: ' + error.message);
+    } else {
+      // Optimistically update local state
+      setActiveSession(prev => prev ? { ...prev, status: 'RESOLVED' } : prev);
+    }
+  };
+
+  const handleTakeOver = async () => {
+    if (!activeSession) return;
+    try {
+      setIsTakingOver(true);
+      const res = await fetch('/backend/api/messages/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: activeSession.id,
+          customer_phone: activeSession.customer_phone,
+          text: "We are currently transferring you to a human agent.",
+          override: true
+        })
+      });
+      if (!res.ok) throw new Error("Takeover failed");
+      setActiveSession({ ...activeSession, status: 'NEEDS_HUMAN' });
+    } catch (error) {
+      console.error(error);
+      alert("Failed to take over session.");
+    } finally {
+      setIsTakingOver(false);
+    }
+  };
+
+  const handleSendMessage = async () => {
+    if (!activeSession || !chatInput.trim() || isSending) return;
+    try {
+      setIsSending(true);
+      const textToSend = chatInput;
+      setChatInput(''); // Optimistically clear input
+      
+      const res = await fetch('/backend/api/messages/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: activeSession.id,
+          customer_phone: activeSession.customer_phone,
+          text: textToSend,
+          override: false
+        })
+      });
+      
+      if (!res.ok) {
+        setChatInput(textToSend); // Revert input on fail
+        throw new Error("Failed to send message");
+      }
+    } catch (error) {
+      console.error(error);
+      alert("Failed to send message.");
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  const handleSelectSession = async (session: Session) => {
+    setActiveSession(session);
+    localStorage.setItem('activeSessionId', session.id);
+
+    // Send blue ticks the moment the human agent opens a NEEDS_HUMAN session
+    if (session.status === 'NEEDS_HUMAN') {
+      try {
+        await fetch(`/backend/api/sessions/${session.id}/read`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ customer_phone: session.customer_phone }),
+        });
+      } catch (err) {
+        console.error('[read-receipt] Failed to send blue ticks:', err);
+      }
+    }
+  };
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -262,22 +378,37 @@ export default function Dashboard() {
               Resolved ({sessions.filter(s => s.status === 'RESOLVED').length})
             </button>
           </div>
+          {/* Search bar */}
+          <div className="px-3 pt-3 pb-1">
+            <div className="relative">
+              <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">search</span>
+              <input
+                type="text"
+                value={sessionSearch}
+                onChange={e => setSessionSearch(e.target.value)}
+                placeholder="Search by phone number…"
+                className="w-full pl-9 pr-4 py-2 silk-pressed rounded-xl text-[13px] placeholder:text-slate-300 focus:outline-none border border-white/40"
+              />
+              {sessionSearch && (
+                <button onClick={() => setSessionSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
+                  <span className="material-symbols-outlined text-[16px]">close</span>
+                </button>
+              )}
+            </div>
+          </div>
           <div className="flex-1 overflow-y-auto p-3 space-y-2">
-            {sessions.length === 0 && (
+            {sessions.filter(s => s.customer_phone.includes(sessionSearch.trim())).length === 0 && (
               <div className="flex flex-col items-center justify-center h-40 text-slate-400">
                 <span className="material-symbols-outlined text-[40px] mb-2">forum</span>
-                <p className="text-[13px]">No sessions yet</p>
+                <p className="text-[13px]">{sessionSearch ? 'No matching sessions' : 'No sessions yet'}</p>
               </div>
             )}
-            {sessions.map(session => {
+            {sessions.filter(s => s.customer_phone.includes(sessionSearch.trim())).map(session => {
               const isActive = activeSession?.id === session.id;
               return (
                 <div
                   key={session.id}
-                  onClick={() => {
-                    setActiveSession(session);
-                    localStorage.setItem('activeSessionId', session.id);
-                  }}
+                  onClick={() => { void handleSelectSession(session); }}
                   className={`p-4 rounded-xl cursor-pointer relative transition-all ${isActive ? 'silk-extruded shadow-md border-indigo-300/30' : 'silk-pressed hover:bg-white/40 border border-transparent hover:border-white/50'}`}
                 >
                   {isActive && <div className="absolute left-0 top-3 bottom-3 w-1 bg-gradient-to-b from-indigo-500 to-violet-500 rounded-r-full" />}
@@ -326,8 +457,32 @@ export default function Dashboard() {
                     </p>
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-3">
                   <StatusBadge status={activeSession.status} />
+                  {activeSession.status !== 'RESOLVED' && (
+                    <button
+                      onClick={handleResolveSession}
+                      disabled={isResolving}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-bold text-emerald-600 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                      title="Mark this conversation as resolved"
+                    >
+                      {isResolving ? (
+                        <svg className="animate-spin h-3.5 w-3.5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                      ) : (
+                        <span className="material-symbols-outlined text-[15px]">check_circle</span>
+                      )}
+                      {isResolving ? 'Resolving…' : 'Resolve'}
+                    </button>
+                  )}
+                  {activeSession.status === 'RESOLVED' && (
+                    <span className="flex items-center gap-1 text-[12px] text-emerald-600 font-semibold">
+                      <span className="material-symbols-outlined text-[15px]">check_circle</span>
+                      Resolved — next message starts a new session
+                    </span>
+                  )}
                 </div>
               </div>
 
@@ -358,29 +513,85 @@ export default function Dashboard() {
 
               {/* Input footer */}
               <div className="p-5 bg-white/60 backdrop-blur-xl border-t border-white/80 z-20 flex-shrink-0">
+                
+                {/* Status indicator / Take over */}
                 <div className="mb-4 px-4 py-2.5 silk-pressed rounded-xl flex items-center justify-between border border-white/60">
-                  <div className="flex items-center gap-2.5 text-slate-400">
-                    <span className="material-symbols-outlined text-[18px]">smart_toy</span>
-                    <span className="text-[13px]">Currently in <strong className="text-slate-700">Bot-Only</strong> mode.</span>
-                  </div>
-                  <button className="silk-extruded hover:text-indigo-600 px-4 py-1.5 rounded-lg text-[12px] font-bold transition-all text-slate-600">
-                    Override & Take Over
-                  </button>
+                  {activeSession.status !== 'NEEDS_HUMAN' ? (
+                    <>
+                      <div className="flex items-center gap-2.5 text-slate-400">
+                        <span className="material-symbols-outlined text-[18px]">smart_toy</span>
+                        <span className="text-[13px]">Currently in <strong className="text-slate-700">Bot-Only</strong> mode.</span>
+                      </div>
+                      <button 
+                        onClick={handleTakeOver}
+                        disabled={isTakingOver || activeSession.status === 'RESOLVED'}
+                        className="silk-extruded hover:text-indigo-600 px-4 py-1.5 rounded-lg text-[12px] font-bold transition-all text-slate-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isTakingOver ? 'Taking over...' : 'Override & Take Over'}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-2.5 text-indigo-500">
+                        <span className="material-symbols-outlined text-[18px]">support_agent</span>
+                        <span className="text-[13px] font-bold">Human Agent Active.</span>
+                      </div>
+                      <span className="text-[12px] text-slate-400 font-medium">Bot replies are paused.</span>
+                    </>
+                  )}
                 </div>
+
+                {/* Chat box */}
                 <div className="flex items-end gap-3">
                   <button disabled className="w-11 h-11 silk-extruded text-slate-300 rounded-xl flex items-center justify-center cursor-not-allowed opacity-50">
                     <span className="material-symbols-outlined text-[24px]">add</span>
                   </button>
                   <div className="flex-1">
                     <textarea
-                      disabled
+                      disabled={activeSession.status !== 'NEEDS_HUMAN' || isSending}
                       rows={1}
-                      placeholder="Type a message..."
-                      className="w-full silk-pressed border border-white/60 rounded-2xl pl-4 pr-12 py-3.5 text-[14px] text-slate-700 placeholder:text-slate-300 focus:outline-none resize-none opacity-60 cursor-not-allowed shadow-inner"
+                      value={chatInput}
+                      onChange={(e) => {
+                        setChatInput(e.target.value);
+                        // Debounced typing indicator: fires after 400ms of inactivity
+                        if (typingDebounceRef.current) clearTimeout(typingDebounceRef.current);
+                        typingDebounceRef.current = setTimeout(() => {
+                          if (activeSession?.status === 'NEEDS_HUMAN') {
+                            fetch(`/backend/api/sessions/${activeSession.id}/read`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ customer_phone: activeSession.customer_phone }),
+                            }).catch(console.error);
+                          }
+                        }, 400);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSendMessage();
+                        }
+                      }}
+                      placeholder={activeSession.status === 'NEEDS_HUMAN' ? "Type your message..." : "Take over to type a message..."}
+                      className="w-full silk-pressed border border-white/60 rounded-2xl pl-4 pr-12 py-3.5 text-[14px] text-slate-700 placeholder:text-slate-300 focus:outline-none resize-none disabled:opacity-60 disabled:cursor-not-allowed shadow-inner"
                     />
                   </div>
-                  <button disabled className="w-12 h-12 silk-pressed text-slate-300 rounded-xl flex items-center justify-center cursor-not-allowed opacity-60">
-                    <span className="material-symbols-outlined">send</span>
+                  <button 
+                    onClick={handleSendMessage}
+                    disabled={activeSession.status !== 'NEEDS_HUMAN' || !chatInput.trim() || isSending}
+                    className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all ${
+                      activeSession.status === 'NEEDS_HUMAN' && chatInput.trim() && !isSending
+                        ? 'bg-indigo-500 text-white shadow-md hover:bg-indigo-600'
+                        : 'silk-pressed text-slate-300 opacity-60 cursor-not-allowed'
+                    }`}
+                  >
+                    {isSending ? (
+                      <svg className="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                      </svg>
+                    ) : (
+                      <span className="material-symbols-outlined">send</span>
+                    )}
                   </button>
                 </div>
               </div>

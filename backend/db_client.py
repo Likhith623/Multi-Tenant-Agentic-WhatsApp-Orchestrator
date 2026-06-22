@@ -16,11 +16,18 @@ _supabase: Client = create_client(
 # ---------------------------------------------------------------------------
 
 async def get_session_by_phone(phone: str) -> dict | None:
-    """Return the session row for a given customer phone, or None."""
+    """
+    Return the most recent ACTIVE session for a given customer phone, or None.
+    A session is active if its status is NOT 'RESOLVED'.
+    If the session is RESOLVED, returns None so a new session is created.
+    """
     res = (
         _supabase.table("sessions")
         .select("*")
         .eq("customer_phone", phone)
+        .neq("status", "RESOLVED")
+        .order("updated_at", desc=True)
+        .limit(1)
         .maybe_single()
         .execute()
     )
@@ -47,13 +54,61 @@ async def set_session_tenant(session_id: str, tenant_id: str) -> None:
 async def update_session_status(session_id: str, status: str) -> None:
     """
     Update the session status field.
-    Used as a database lock:
+    Valid statuses:
       - 'AGENT_RESPONDING' → locks the session (no new runs allowed)
-      - 'WAITING_FOR_BOT'  → unlocks the session
+      - 'WAITING_FOR_BOT'  → unlocks the session, awaiting next customer message
+      - 'NEEDS_HUMAN'      → halts all bot auto-replies, flags for human takeover
+      - 'RESOLVED'         → conversation is closed; next message starts a new session
     """
     _supabase.table("sessions").update(
         {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
     ).eq("id", session_id).execute()
+
+
+async def resolve_session(session_id: str) -> None:
+    """Mark a session as RESOLVED. The next message from this customer
+    will automatically create a fresh session."""
+    await update_session_status(session_id, "RESOLVED")
+    print(f"[db_client] Session {session_id} → RESOLVED")
+
+
+async def get_stale_sessions(idle_minutes: int = 20) -> list[dict]:
+    """
+    Return all sessions that have been in WAITING_FOR_BOT status for longer
+    than `idle_minutes` without any new messages from the customer.
+    Used by the inactivity auto-resolver background task.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=idle_minutes)).isoformat()
+    res = (
+        _supabase.table("sessions")
+        .select("id, customer_phone, tenant_id, updated_at")
+        .eq("status", "WAITING_FOR_BOT")
+        .lt("updated_at", cutoff)
+        .execute()
+    )
+    return res.data or []
+
+
+async def get_last_inbound_message_id(session_id: str) -> str | None:
+    """
+    Return the WhatsApp message_id (wamid.xxx) of the most recent inbound
+    message in this session. Used to send read receipts and typing indicators
+    when a human agent opens or replies in a NEEDS_HUMAN session.
+    Returns None if there are no inbound messages yet.
+    """
+    res = (
+        _supabase.table("messages")
+        .select("id")
+        .eq("session_id", session_id)
+        .eq("direction", "inbound")
+        .order("timestamp", desc=True)
+        .limit(1)
+        .maybe_single()
+        .execute()
+    )
+    return res.data["id"] if res.data else None
+
 
 
 # ---------------------------------------------------------------------------

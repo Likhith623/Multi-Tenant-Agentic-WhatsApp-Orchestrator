@@ -8,6 +8,7 @@ import DashboardLayout from '@/components/DashboardLayout';
 export default function TenantsPage() {
   const { tenants, refreshTenants } = useTenant();
   const [isCreating, setIsCreating] = useState(false);
+  const [tenantSearch, setTenantSearch] = useState('');
 
   const handleCreateTenant = async () => {
     const name = prompt("Enter the name of the new tenant:");
@@ -52,19 +53,37 @@ export default function TenantsPage() {
     <DashboardLayout>
       <main className="flex-1 overflow-y-auto p-8">
         <div className="max-w-4xl mx-auto space-y-8">
-          <div className="flex justify-between items-end">
+          <div className="flex justify-between items-end gap-4">
             <div>
               <h1 className="text-2xl font-bold text-slate-800 tracking-tight">Tenants</h1>
               <p className="text-slate-500 mt-1">Manage all business clients in the orchestrator.</p>
             </div>
-            <button
-              onClick={handleCreateTenant}
-              disabled={isCreating}
-              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold shadow-sm transition-colors flex items-center gap-2"
-            >
-              <span className="material-symbols-outlined text-[20px]">add_business</span>
-              {isCreating ? 'Creating...' : 'Create Tenant'}
-            </button>
+            <div className="flex items-center gap-3 flex-shrink-0">
+              {/* Search */}
+              <div className="relative w-52">
+                <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">search</span>
+                <input
+                  type="text"
+                  value={tenantSearch}
+                  onChange={e => setTenantSearch(e.target.value)}
+                  placeholder="Search tenants…"
+                  className="w-full pl-9 pr-4 py-2 silk-pressed rounded-xl text-[13px] placeholder:text-slate-300 focus:outline-none border border-white/40"
+                />
+                {tenantSearch && (
+                  <button onClick={() => setTenantSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
+                    <span className="material-symbols-outlined text-[16px]">close</span>
+                  </button>
+                )}
+              </div>
+              <button
+                onClick={handleCreateTenant}
+                disabled={isCreating}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold shadow-sm transition-colors flex items-center gap-2"
+              >
+                <span className="material-symbols-outlined text-[20px]">add_business</span>
+                {isCreating ? 'Creating...' : 'Create Tenant'}
+              </button>
+            </div>
           </div>
 
           <div className="silk-card rounded-2xl overflow-hidden border border-white/50">
@@ -77,7 +96,12 @@ export default function TenantsPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {tenants.map(tenant => (
+                {tenants
+                  .filter(t =>
+                    t.name.toLowerCase().includes(tenantSearch.toLowerCase().trim()) ||
+                    t.id.toLowerCase().includes(tenantSearch.toLowerCase().trim())
+                  )
+                  .map(tenant => (
                   <tr key={tenant.id} className="hover:bg-slate-50/50 transition-colors">
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-3">

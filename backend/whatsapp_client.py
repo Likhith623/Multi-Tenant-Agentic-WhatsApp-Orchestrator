@@ -45,30 +45,17 @@ async def mark_message_read(message_id: str) -> None:
 
 async def toggle_typing_indicator(to_phone: str, on: bool = True) -> None:
     """
-    Explicitly stop the typing indicator once the reply has been sent.
-    Calling with on=False sends `type: 'pause'` to clear the bubble.
+    No-op stub kept for API compatibility.
 
-    NOTE: Starting the typing indicator is now handled inside mark_message_read()
-    using the combined read-receipt payload. Only call this directly to STOP it.
-    The indicator auto-clears after 25 seconds anyway, so this is just hygiene.
+    Starting the typing indicator is now handled inside mark_message_read()
+    using the combined read-receipt + typing_indicator payload (the only
+    format Meta's WhatsApp Cloud API accepts).
+
+    Stopping the indicator explicitly is not needed — WhatsApp automatically
+    clears the typing bubble as soon as the actual reply message is delivered.
+    Meta does not accept any 'pause' or stop action via the API.
     """
-    if on:
-        # Starting is handled by mark_message_read — nothing to do here.
-        return
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "status": "read",
-        "typing_indicator": {"type": "pause"},
-        "to": to_phone,
-    }
-    async with httpx.AsyncClient() as client:
-        try:
-            res = await client.post(_BASE_URL, json=payload, headers=_HEADERS)
-            if res.status_code != 200:
-                print(f"[whatsapp_client] Typing stop failed: {res.status_code} - {res.text}")
-        except Exception as e:
-            print(f"[whatsapp_client] Exception stopping typing indicator: {e}")
+    return
 
 
 async def send_text_message(to_phone: str, text: str) -> str | None:

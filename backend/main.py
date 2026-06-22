@@ -12,24 +12,93 @@ Security:
   valid signature are rejected with HTTP 401.
 """
 
+import asyncio
 import hashlib
 import hmac
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 import worker
+import db_client
+import whatsapp_client
 
 load_dotenv()
 
-app = FastAPI(title="Multi-Tenant WhatsApp Orchestrator")
+INACTIVITY_MINUTES = 20   # Auto-resolve after this many minutes of silence
+INACTIVITY_CHECK_INTERVAL = 60  # Check every N seconds
+
+INACTIVITY_FAREWELL = (
+    "\u23f0 We haven't heard from you in a while, so we're ending this session now. "
+    "Thank you for chatting with us! "
+    "Feel free to message us again anytime if you need further help. \U0001f60a"
+)
+
+
+async def _inactivity_resolver_loop() -> None:
+    """
+    Background task that runs every minute.
+    Finds sessions idle for >20 min and auto-resolves them with a farewell message.
+    """
+    print(f"[inactivity] Auto-resolver started. Idle threshold: {INACTIVITY_MINUTES} min.")
+    while True:
+        await asyncio.sleep(INACTIVITY_CHECK_INTERVAL)
+        try:
+            stale = await db_client.get_stale_sessions(idle_minutes=INACTIVITY_MINUTES)
+            if stale:
+                print(f"[inactivity] Found {len(stale)} stale session(s) to resolve.")
+            for session in stale:
+                session_id = session["id"]
+                phone = session["customer_phone"]
+                try:
+                    # Send farewell message
+                    msg_id = await whatsapp_client.send_text_message(phone, INACTIVITY_FAREWELL)
+                    if msg_id:
+                        await db_client.insert_message(
+                            message_id=msg_id,
+                            session_id=session_id,
+                            direction="outbound",
+                            content_type="text",
+                            text_content=INACTIVITY_FAREWELL,
+                        )
+                    await db_client.resolve_session(session_id)
+                    print(f"[inactivity] Session {session_id} ({phone}) → RESOLVED (idle {INACTIVITY_MINUTES}+ min)")
+                except Exception as e:
+                    print(f"[inactivity] ERROR resolving session {session_id}: {e}")
+        except Exception as e:
+            print(f"[inactivity] Loop error: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start background tasks on startup, clean up on shutdown."""
+    task = asyncio.create_task(_inactivity_resolver_loop())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        print("[inactivity] Auto-resolver stopped.")
+
 
 VERIFY_TOKEN = os.environ.get("WEBHOOK_VERIFY_TOKEN", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
+
+app = FastAPI(title="Multi-Tenant WhatsApp Orchestrator", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -234,3 +303,66 @@ async def trigger_broadcast(req: BroadcastRequest):
             results["failed"].append(phone)
 
     return {"status": "completed", "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Human Chat API
+# ---------------------------------------------------------------------------
+
+class ChatRequest(BaseModel):
+    session_id: str
+    customer_phone: str
+    text: str
+    override: bool = False
+
+
+class SessionReadRequest(BaseModel):
+    customer_phone: str
+
+
+@app.post("/api/sessions/{session_id}/read")
+async def mark_session_read(session_id: str, body: SessionReadRequest):
+    """
+    Send a WhatsApp read receipt for the last inbound message in this session.
+    Called by the dashboard the moment a human agent opens/selects a chat.
+    This produces the blue double-ticks on the customer's side.
+    Only meaningful for NEEDS_HUMAN sessions — bot sessions handle their own receipts.
+    """
+    last_wamid = await db_client.get_last_inbound_message_id(session_id)
+    if last_wamid:
+        await whatsapp_client.mark_message_read(last_wamid)
+        print(f"[api:read] Blue ticks sent for session {session_id} (wamid={last_wamid})")
+        return {"status": "read_receipt_sent", "message_id": last_wamid}
+    return {"status": "no_inbound_messages"}
+
+
+@app.post("/api/messages/send")
+async def send_human_message(req: ChatRequest):
+    """
+    Sends a message from a human agent to the WhatsApp user.
+    - If override=True: also sets session to NEEDS_HUMAN to halt bot replies.
+    - Fires a typing indicator (via mark_message_read) before sending so the
+      customer sees a "typing…" bubble for ~1.5 seconds first.
+    """
+    if req.override:
+        await db_client.update_session_status(req.session_id, "NEEDS_HUMAN")
+        print(f"[api:chat] Session {req.session_id} overridden by human.")
+
+    # Typing indicator: reuse mark_message_read which triggers the bubble
+    last_wamid = await db_client.get_last_inbound_message_id(req.session_id)
+    if last_wamid:
+        await whatsapp_client.mark_message_read(last_wamid)
+        await asyncio.sleep(1.5)   # Let the typing bubble be visible before message arrives
+
+    msg_id = await whatsapp_client.send_text_message(req.customer_phone, req.text)
+    if msg_id:
+        await db_client.insert_message(
+            message_id=msg_id,
+            session_id=req.session_id,
+            direction="outbound",
+            content_type="text",
+            text_content=req.text,
+        )
+        return {"status": "success", "message_id": msg_id}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send message via Meta API")

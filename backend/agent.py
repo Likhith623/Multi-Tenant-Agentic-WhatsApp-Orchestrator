@@ -79,10 +79,12 @@ _vision_llm = ChatGoogleGenerativeAI(
 @tool
 def attach_media(keyword: str) -> str:
     """
-    Use this tool when the user is requesting a specific media asset such as
-    a product catalog, an image, a diagram, or an invoice.
-    Pass the exact keyword that matches the media the user requested.
-    Do NOT use markdown links — always use this tool for files.
+    Send a media file to the user on WhatsApp (image, PDF, or document).
+
+    Use this tool whenever the user asks for any file, image, or document
+    that appears in the AVAILABLE MEDIA ASSETS list in the system prompt.
+    Pass the exact keyword string from that list.
+    Never say you cannot send files — use this tool instead.
     """
     return keyword
 
@@ -101,7 +103,30 @@ def escalate_to_human(reason: str) -> str:
     return reason
 
 
-_tools = [attach_media, escalate_to_human]
+@tool
+def close_conversation(farewell_message: str) -> str:
+    """
+    Gracefully close this conversation and mark the session as RESOLVED.
+
+    Use this tool when the user clearly signals they are done, for example:
+    - "Thank you", "Thanks", "Thanks for your help"
+    - "Goodbye", "Bye", "See you", "That's all"
+    - "I'm good", "Got it, thanks", "All done"
+    - Any clear conversational farewell or sign-off
+
+    The farewell_message you provide will be sent to the user before the
+    session is closed. Keep it warm, brief, and friendly.
+
+    After calling this tool the session is RESOLVED. The customer can start
+    a fresh conversation at any time by sending a new message.
+
+    Args:
+        farewell_message: The goodbye message to send to the user.
+    """
+    return farewell_message
+
+
+_tools = [attach_media, escalate_to_human, close_conversation]
 _llm_with_tools = _llm.bind_tools(_tools)
 
 
@@ -126,7 +151,7 @@ class AgentState(TypedDict):
     # --- Populated by: Context Retriever Node ---
     tenant_name: str
     tenant_prompt: str
-    media_library: dict[str, str]   # e.g. {"catalog": "https://..."}
+    media_library: list | dict   # list [{id,name,url,type,...}] or legacy dict {"name": "url"}
     chat_history: list[BaseMessage] # LangChain message objects (last 5 msgs)
 
     # --- Populated by: LLM Reasoning Node ---
@@ -240,8 +265,39 @@ async def llm_reasoning_node(state: AgentState) -> AgentState:
       Gemini natively processes this to describe the image in the context of
       the tenant's business.
     """
-    media_library: dict = state["media_library"]
+    # Normalise media_library regardless of storage format:
+    #   New format (from frontend): list of {id, name, url, type, ...}
+    #   Legacy format: dict {"keyword": "url"}
+    # Keys are lowercased so the LLM's keyword (also lowercased) always matches,
+    # regardless of how the user capitalised the name in the Media Library UI.
+    raw_library = state["media_library"] or []
+    if isinstance(raw_library, list):
+        media_library: dict[str, str] = {
+            item["name"].lower().strip(): item["url"]
+            for item in raw_library
+            if item.get("name") and item.get("url")
+        }
+    else:
+        media_library: dict[str, str] = {
+            k.lower().strip(): v for k, v in raw_library.items()
+        }
     media_keywords = list(media_library.keys())
+
+    # Build the media section separately to avoid f-string nesting issues
+    if media_keywords:
+        media_lines = "\n".join(f'  - keyword: "{kw}"' for kw in media_keywords)
+        media_section = (
+            "AVAILABLE MEDIA ASSETS:\n"
+            "The following files are available to send to the user. "
+            "When the user's request matches or is clearly related to one of these assets, "
+            "you MUST call the attach_media tool with the exact keyword shown.\n"
+            + media_lines
+            + "\n\nMEDIA RULE: If the user's request can be fulfilled by any asset above, "
+            "call attach_media with the matching keyword. "
+            "Never apologise or say you lack the capability — use the tool."
+        )
+    else:
+        media_section = "MEDIA ASSETS: No media assets have been uploaded for this tenant yet."
 
     system_prompt = f"""You are a helpful customer support and sales agent for {state['tenant_name']}.
 
@@ -249,12 +305,10 @@ async def llm_reasoning_node(state: AgentState) -> AgentState:
 
 IMPORTANT FORMATTING RULES:
 - Never use markdown links like [text](url). WhatsApp does not render them.
-- If a user requests a file, catalog, image, or document, you MUST use the attach_media tool.
-- If you must share a URL as plain text, type the raw URL directly with no brackets.
 - Keep responses concise and friendly for a mobile messaging format.
+- NEVER say you cannot send files or media. You always have the attach_media tool available.
 
-AVAILABLE MEDIA ASSETS (keywords you can pass to attach_media):
-{', '.join(media_keywords) if media_keywords else 'No media assets available.'}
+{media_section}
 
 SENTIMENT ANALYSIS & ESCALATION RULES:
 - Assess the user's emotional state in every message.
@@ -262,6 +316,31 @@ SENTIMENT ANALYSIS & ESCALATION RULES:
   EXPLICITLY asks to speak with a human (e.g., "I want to talk to a real person",
   "this is ridiculous", "I'm so angry"), you MUST use the escalate_to_human tool.
 - Do NOT escalate for minor complaints or simple confusion — only for genuine distress.
+
+CONVERSATION CLOSING RULES:
+You have access to the last 5 messages of this conversation. Before deciding
+to close the session, reason across the ENTIRE conversation context, not just
+the latest message in isolation.
+
+Only call close_conversation if ALL of the following are true:
+  1. The user's original question or request appears to have been FULLY answered
+     (check the previous bot replies — did we actually resolve what they asked?).
+  2. The user's latest message signals satisfaction or wrap-up — such as:
+     "thank you", "thanks", "great", "perfect", "got it", "that's all", "bye",
+     "goodbye", "see you", "I'm good now", "all done", "cheers", "ok thanks".
+  3. There are NO unanswered questions or pending requests visible in the
+     recent messages.
+
+Do NOT close if:
+  - The user said something like "okay" or "got it" but the conversation clearly
+    continues (e.g., they just acknowledged something and may ask more).
+  - The latest message is ambiguous without context (e.g., "ok" by itself mid-flow).
+  - The user's issue was NOT resolved and they are just being polite.
+
+When you do call close_conversation, write a farewell_message that:
+  - Thanks them specifically for what they asked about (personalise it).
+  - Reminds them they can message again anytime.
+  - Is warm, brief (2-3 sentences max), and conversational in tone.
 
 IMAGE HANDLING:
 - If you receive an image, describe what you see in the context of the business.
@@ -359,7 +438,19 @@ async def dispatcher_node(state: AgentState) -> AgentState:
     ai_message: AIMessage = state["ai_message"]
     from_phone = state["from_phone"]
     session_id = state["session_id"]
-    media_library: dict = state["media_library"]
+    # Normalise media_library (same logic as llm_reasoning_node).
+    # Keys are lowercased to match the lowercased keyword from the LLM tool call.
+    raw_library = state["media_library"] or []
+    if isinstance(raw_library, list):
+        media_library: dict[str, str] = {
+            item["name"].lower().strip(): item["url"]
+            for item in raw_library
+            if item.get("name") and item.get("url")
+        }
+    else:
+        media_library: dict[str, str] = {
+            k.lower().strip(): v for k, v in raw_library.items()
+        }
 
     try:
         if ai_message.tool_calls:
@@ -370,12 +461,12 @@ async def dispatcher_node(state: AgentState) -> AgentState:
                 # -------------------------------------------------------------
                 if tool_call["name"] == "escalate_to_human":
                     reason = tool_call["args"].get("reason", "User requested human agent.")
-                    print(f"[agent:dispatcher] 🚨 ESCALATING to human: {reason}")
+                    print(f"[agent:dispatcher] \U0001f6a8 ESCALATING to human: {reason}")
 
                     farewell = (
                         "I understand your frustration and I sincerely apologise. "
                         "I've escalated this conversation to one of our human agents "
-                        "who will be with you shortly. 🙏"
+                        "who will be with you shortly. \U0001f64f"
                     )
                     out_id = await whatsapp_client.send_text_message(from_phone, farewell)
                     if out_id:
@@ -389,8 +480,33 @@ async def dispatcher_node(state: AgentState) -> AgentState:
 
                     # Set status to NEEDS_HUMAN — worker.py will halt all future auto-replies
                     await db_client.update_session_status(session_id, "NEEDS_HUMAN")
-                    print(f"[agent:dispatcher] Session {session_id} → NEEDS_HUMAN")
+                    print(f"[agent:dispatcher] Session {session_id} \u2192 NEEDS_HUMAN")
                     return state  # Skip the finally block's status reset
+
+                # -------------------------------------------------------------
+                # CASE 1b: Close conversation — user said thank you / goodbye
+                # -------------------------------------------------------------
+                elif tool_call["name"] == "close_conversation":
+                    farewell_msg = tool_call["args"].get(
+                        "farewell_message",
+                        "Thank you for chatting with us! \U0001f60a We're ending this session now. "
+                        "Feel free to message us again anytime if you need further assistance."
+                    )
+                    print(f"[agent:dispatcher] \u2705 CLOSING conversation for session {session_id}")
+
+                    out_id = await whatsapp_client.send_text_message(from_phone, farewell_msg)
+                    if out_id:
+                        await db_client.insert_message(
+                            message_id=out_id,
+                            session_id=session_id,
+                            direction="outbound",
+                            content_type="text",
+                            text_content=farewell_msg,
+                        )
+
+                    await db_client.resolve_session(session_id)
+                    print(f"[agent:dispatcher] Session {session_id} \u2192 RESOLVED (user sign-off)")
+                    return state  # Skip finally block's WAITING_FOR_BOT reset
 
                 # -------------------------------------------------------------
                 # CASE 2: Media attachment — LLM wants to send an asset
